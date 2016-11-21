@@ -56,10 +56,10 @@ for a known position when it revisits an area. Below are some examples of maps w
 
 The most common method of active loop closure is to build a topology graph on top of the occupancy grid, and as new nodes are added,
 try to merge nodes that are close in euclidean distance, but distance in graph distance.
-<img src="images/graph_building.png" width="600" alt="final maps"  style="margin: auto;display: block;">
+<img src="images/graphs.png" width="600" alt="graphs on map"  style="margin: auto;display: block;">
 
 Here, we can see the current code inserting a new node onto the topology graph:
-<img src="images/graph_building.png" width="600" alt="final maps"  style="margin: auto;display: block;">
+<img src="images/building_graph.gif" width="600" alt="current code"  style="margin: auto;display: block;">
 
 
 <a name="appendix"/>
