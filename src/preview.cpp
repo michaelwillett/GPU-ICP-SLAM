@@ -20,7 +20,7 @@ std::string currentTimeString() {
 }
 
 
-#define VISUALIZE 0
+#define VISUALIZE 1
 
 //-------------------------------
 //----------SETUP STUFF----------

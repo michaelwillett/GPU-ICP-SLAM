@@ -1,5 +1,5 @@
 **University of Pennsylvania, CIS 565: GPU Programming and Architecture,
-Project 5 - GPU Particle Filter SLAM **
+Final Project - GPU Rao-Blackwellized Particle Filter SLAM **
 
 * Michael Willett
 * Tested on: Windows 10, I5-4690k @ 3.50GHz 16.00GB, GTX 750-TI 2GB (Personal Computer)
@@ -32,7 +32,7 @@ results can be achieved from visual sensor data only, without any need to develo
 
 
 <a name="part1"/>
-## Section 1: Particle Filter SLAM Algorithm
+## Section 1: Basic Particle Filter SLAM Algorithm
 
 The Particle Filter algorithm can be broken into six basic steps:
 
@@ -47,33 +47,20 @@ position and each measured collision.
 
 
 <a name="part2"/>
-## Section 2: Performance
-*Iteration timers were run using the chrono library. Maps generated on the GPU were run using 5000 particles, a occupancy 
-grid with uniform cell size of 2.5 cm, and particle noise of 1.5 cm in x and y directions, and .85 degrees rotation.*
+## Section 2: Improving the Algorithm
+One major problem with simple SLAM algorithms is the issue of loop closure. This occurs when the sensor travels for a relatively
+long distance into new environments, and slowly minor positional errors in the mapping will result in the final map not adjusting
+for a known position when it revisits an area. Below are some examples of maps with good loop closure:
 
-<img src="images/completed_maps.png" width="1000" alt="final maps"  style="margin: auto;display: block;">
+<img src="images/goal_maps.png" width="600" alt="final maps"  style="margin: auto;display: block;">
 
-While there is little qualatative analysis that can be used to evaluate the accuracy of the final results without having
-the floorplan for buildings being mapped, the above images show very clear floor plans for five different data sets.
-All sensor data was performed with a lidar with unknown sensor noise, a range of up to 5 meters over a 270 degree arc in
-.25 degree intervals. While IMU and odometry sensor data was available to use for improving accuracy, the maps above clearly 
-show that vision only SLAM is entirely viable when CPU runtime is not the primary bottleneck. Below, the comparison between
-50, 5,000, and 50,000  particles can be seen in the final map to evaluate loop closure and returning to the original state.
+The most common method of active loop closure is to build a topology graph on top of the occupancy grid, and as new nodes are added,
+try to merge nodes that are close in euclidean distance, but distance in graph distance.
+<img src="images/graph_building.png" width="600" alt="final maps"  style="margin: auto;display: block;">
 
-<img src="images/particle_counts.png" width="1000" alt="particle variation"  style="margin: auto;display: block;">
+Here, we can see the current code inserting a new node onto the topology graph:
+<img src="images/graph_building.png" width="600" alt="final maps"  style="margin: auto;display: block;">
 
-For specific time imrpovements, the table below shows that for 5000 particles, we see massive time improvements in the measurement
-update step when evaluating all particles as would be expected. The parallel implementation shows a near 150 fold improvement overall.
-In terms of total processing speed, the 5000 particle benchmark ran around 170 Hz. Since sensor data is coming in at a 40 Hz rate, this
-allows for processing a large sample space in real time with additional headroom for running other operations on the machine. Even at
-50,000 particles, the GPU implementation ran at ~20 Hz, which would be perfectly acceptable if the sensor data was subsampled every 2 or 3
-readings, however, accuracy improvements appear negligible for loop-closure.
-
-<img src="images/runtime.png" width="300" alt="runtime"  style="margin: auto;display: block;">
-<img src="images/throughput.png" width="600" alt="throughput by particle count"  style="margin: auto;display: block;">
-
-*Note: unfortunately NVidia NSight Analysis does not properly load matlab libraries, so detailed thread performance could not be without
-refactoring the data import code*
 
 <a name="appendix"/>
 ## Appendix: Build Instructions

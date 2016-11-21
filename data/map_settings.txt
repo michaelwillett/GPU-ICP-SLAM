@@ -3,11 +3,11 @@ CAMERA
 RES         800 800
 FOVY        45
 FILE        map0
-EYE         0.0 0.0 15
+EYE         0.0 0.0 25
 LOOKAT      0 0 0
 UP          0 1 0
 
-// Map in meters
+// Patch size in meters
 MAP
 SIZE 	50 50
 RES	.025

@@ -8,6 +8,7 @@
 #include <glm/gtc/matrix_inverse.hpp>
 #include <iostream>
 #include <cstdio>
+#include <cuda.h>
 
 #include "utilities.h"
 

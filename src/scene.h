@@ -19,6 +19,6 @@ public:
     Scene(string filename);
     ~Scene();
 
-    std::vector<Geom> geoms;
+    std::vector<Patch> maps;
     RenderState state;
 };

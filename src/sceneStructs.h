@@ -3,43 +3,11 @@
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
+#include <thrust/device_vector.h>
 #include "glm/glm.hpp"
 
 #define BACKGROUND_COLOR (glm::vec3(0.0f))
-
-enum GeomType {
-    SPHERE,
-    CUBE,
-};
-
-struct Ray {
-    glm::vec3 origin;
-	glm::vec3 direction;
-	int indexOfRefraction;
-};
-
-struct Geom {
-    enum GeomType type;
-    glm::vec3 translation;
-    glm::vec3 rotation;
-    glm::vec3 scale;
-    glm::mat4 transform;
-    glm::mat4 inverseTransform;
-    glm::mat4 invTranspose;
-	glm::vec3 resolution;
-};
-
-struct Material {
-    glm::vec3 color;
-    struct {
-        float exponent;
-        glm::vec3 color;
-    } specular;
-    float hasReflective;
-    float hasRefractive;
-    float indexOfRefraction;
-    float emittance;
-};
+#define MAP_TYPE char
 
 struct Camera {
     glm::ivec2 resolution;
@@ -58,24 +26,30 @@ struct RenderState {
     std::string imageName;
 };
 
-struct PathSegment {
-	Ray ray;
-    glm::vec3 color;
-	int pixelIndex;
-	int remainingBounces;
+struct ParticleHistory {
+	std::vector<glm::vec3> patchPos;
 };
 
-enum MaterialShadingTechnique {
-	PHONG_DIFFUSE,
-	PHONG_SPECULAR
+struct Particle {
+	glm::vec3 pos;
+	float w;
+	unsigned char cluster;
+	ParticleHistory *map;
 };
 
-// Use with a corresponding PathSegment to do:
-// 1) color contribution computation
-// 2) BSDF evaluation: generate a new ray
-struct ShadeableIntersection {
-  float t;
-  glm::vec3 surfaceNormal;
-  int materialId;
-  bool outside;
+struct Patch {
+	glm::vec3 scale;
+	glm::vec3 resolution;
+	MAP_TYPE *grid;
+	unsigned char uid;
+};
+
+
+struct Cluster {
+	unsigned char id;
+	unsigned int nodeIdx;
+	std::vector<unsigned int> patchList;
+
+	std::vector<glm::vec2> nodes;
+	std::vector<std::vector<unsigned int>> edges;
 };

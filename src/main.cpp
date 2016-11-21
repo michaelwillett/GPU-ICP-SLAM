@@ -108,7 +108,7 @@ void saveImage() {
 
 void runCuda(bool Visualize) {
     if (camchanged) {
-        iteration = 0;
+        //iteration = 0;
         Camera &cam = renderState->camera;
 		cameraPosition.x = dx;
 		cameraPosition.y = dy;
@@ -119,7 +119,6 @@ void runCuda(bool Visualize) {
 		cam.lookAt.y = cameraPosition.y;
 		cam.lookAt.z = 0;
         camchanged = false;
-		std::cout << cam.position.x << " " << cam.position.y << " " << cam.position.z << std::endl;
       }
 
     // Map OpenGL buffer object for writing from CUDA on a single GPU
@@ -128,6 +127,7 @@ void runCuda(bool Visualize) {
     if (iteration == 0) {
         particleFilterFree();
 		particleFilterInit(scene);
+		iteration = 5000;
     }
 
 	bool done = (iteration >= lidar->scans.size() - 1);
@@ -188,12 +188,12 @@ void mousePositionCallback(GLFWwindow* window, double xpos, double ypos) {
 		//theta = std::fmax(0.001f, std::fmin(theta, PI));
 		dx += (xpos - lastX);
 		dy -= (ypos - lastY);
-		//camchanged = true;
+		camchanged = true;
 	}
 	else if (rightMousePressed) {
-		zoom += (ypos - lastY) / height;
+		zoom *= 1.0f + (ypos - lastY) / height;
 		zoom = std::fmax(0.1f, zoom);
-		//camchanged = true;
+		camchanged = true;
 	}
 	else if (middleMousePressed) {
 		//renderState = &scene->state;

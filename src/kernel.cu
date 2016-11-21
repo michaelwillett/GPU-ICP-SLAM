@@ -12,78 +12,52 @@
 #include <thrust/extrema.h>
 #include <thrust/partition.h>
 
-#include "intersections.h"
 #include "sceneStructs.h"
 #include "scene.h"
 #include "glm/glm.hpp"
 #include "glm/gtx/norm.hpp"
 #include "utilities.h"
+#include "draw.h"
 #include "kernel.h"
 
-
+// Function Device Control
 #define GPU_MOTION		1
 #define GPU_MEASUREMENT 1
 #define GPU_MAP			1
 #define GPU_RESAMPLE	1
 
-#define LIDAR_ANGLE(i) (-135.0f + i * .25f) * PI / 180
-#define LIDAR_SIZE 1081
+// Particle Filter Controls
 #define PARTICLE_COUNT 5000
-#define COV {0.015, 0.015, .015}
 #define EFFECTIVE_PARTICLES .7
-#define MAP_TYPE char
 #define FREE_WEIGHT -1
 #define OCCUPIED_WEIGHT 3
+#define TOPOLOGY_SPLIT 3.5f
+#define WALL_CONFIDENCE 50
 
+// Sensor Configuration
+#define LIDAR_ANGLE(i) (-135.0f + i * .25f) * PI / 180
+#define LIDAR_SIZE 1081
+#define LIDAR_RANGE 20.0f
+#define COV {0.015, 0.015, .015}
+
+// GPU calculations
 #define BLOCK_SIZE 128
-#define ERRORCHECK 1
 
+// Helper Functions
 #define CLAMP(a, lo, hi) (a < lo) ? lo : (a > hi) ? hi : a
 
-#define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
-#define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 
-void checkCUDAErrorFn(const char *msg, const char *file, int line) {
-#if ERRORCHECK
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    if (cudaSuccess == err) {
-        return;
-    }
-
-    fprintf(stderr, "CUDA error");
-    if (file) {
-        fprintf(stderr, " (%s:%d)", file, line);
-    }
-    fprintf(stderr, ": %s: %s\n", msg, cudaGetErrorString(err));
-#  ifdef _WIN32
-    getchar();
-#  endif
-    exit(EXIT_FAILURE);
-#endif
-}
-
-//Kernel that writes the image to the OpenGL PBO directly.
-__global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution,
-        int iter, glm::vec3* image) {
-    int x = (blockIdx.x * blockDim.x) + threadIdx.x;
-    int y = (blockIdx.y * blockDim.y) + threadIdx.y;
-
-    if (x < resolution.x && y < resolution.y) {
-        int index = x + (y * resolution.x);
-        glm::vec3 pix = image[index];
-
-        glm::ivec3 color;
-        color.x = glm::clamp((int) (pix.x / iter * 255.0), 0, 255);
-        color.y = glm::clamp((int) (pix.y / iter * 255.0), 0, 255);
-        color.z = glm::clamp((int) (pix.z / iter * 255.0), 0, 255);
-
-        // Each thread writes one pixel location in the texture (textel)
-        pbo[index].w = 0;
-        pbo[index].x = color.x;
-        pbo[index].y = color.y;
-        pbo[index].z = color.z;
-    }
+/**
+* Handy-dandy hash function that provides seeds for random number generation.
+*/
+__host__ __device__ unsigned int utilhash(unsigned int a) {
+	a = (a + 0x7ed55d16) + (a << 12);
+	a = (a ^ 0xc761c23c) ^ (a >> 19);
+	a = (a + 0x165667b1) + (a << 5);
+	a = (a + 0xd3a2646c) ^ (a << 9);
+	a = (a + 0xfd7046c5) + (a << 3);
+	a = (a ^ 0xb55a4f09) ^ (a >> 16);
+	return a;
 }
 
 __host__ __device__ thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int depth) {
@@ -93,18 +67,19 @@ __host__ __device__ thrust::default_random_engine makeSeededRandomEngine(int ite
 
 static Scene * hst_scene = NULL;
 static glm::vec3 * dev_image = NULL;
-static Geom * dev_geoms = NULL;
+static Patch * dev_maps = NULL;
 
 // host variables
 static MAP_TYPE *occupancyGrid = NULL;
-static glm::vec4 particles[PARTICLE_COUNT];
+static Particle particles[PARTICLE_COUNT];
 static glm::ivec2 map_dim;
-static Geom map_params;
+static Patch map_params;
 static glm::vec3 robotPos;
+static std::vector<Cluster> clusters;
 
 // device variable
 static MAP_TYPE *dev_occupancyGrid = NULL;
-static glm::vec4 *dev_particles = NULL;
+static Particle *dev_particles = NULL;
 static int *dev_fit = NULL;
 static float *dev_lidar = NULL;
 static float *dev_weights = NULL;
@@ -123,10 +98,10 @@ void particleFilterInit(Scene *scene) {
 	cudaMalloc(&dev_image, pixelcount * sizeof(glm::vec3));
 	cudaMemset(dev_image, 0, pixelcount * sizeof(glm::vec3));
 
-	cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
-	cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
+	cudaMalloc(&dev_maps, scene->maps.size() * sizeof(Patch));
+	cudaMemcpy(dev_maps, scene->maps.data(), scene->maps.size() * sizeof(Patch), cudaMemcpyHostToDevice);
 
-	map_params = scene->geoms[0];
+	map_params = scene->maps[0];
 	map_dim = glm::ivec2(map_params.scale.x / map_params.resolution.x, map_params.scale.y / map_params.resolution.y);
 
 	occupancyGrid = new MAP_TYPE[map_dim.x*map_dim.y];
@@ -134,18 +109,19 @@ void particleFilterInit(Scene *scene) {
 	long max_val = 1 << (sizeof(MAP_TYPE) * 8 - 1);
 	memset(occupancyGrid, -1*(max_val-1)*0, map_dim.x*map_dim.y*sizeof(MAP_TYPE));
 
-	//particles = new glm::vec4[PARTICLE_COUNT]; 
 	for (int i = 0; i < PARTICLE_COUNT; i++) {
-		particles[i] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+		particles[i].pos = glm::vec3(0.0f, 0.0f, 0.0f);
+		particles[i].w = 1.0f;
+		particles[i].cluster = 0;
 	}
 
 	robotPos = glm::vec3(0.0f);
 
-	cudaMalloc(&dev_occupancyGrid, map_dim.x*map_dim.y * sizeof(MAP_TYPE));
+	cudaMalloc((void**)&dev_occupancyGrid, map_dim.x*map_dim.y * sizeof(MAP_TYPE));
 	cudaMemcpy(dev_occupancyGrid, occupancyGrid, map_dim.x*map_dim.y * sizeof(MAP_TYPE), cudaMemcpyHostToDevice);
 
-	cudaMalloc(&dev_particles, PARTICLE_COUNT * sizeof(glm::vec4));
-	cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyHostToDevice);
+	cudaMalloc((void**)&dev_particles, PARTICLE_COUNT * sizeof(Particle));
+	cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(Particle), cudaMemcpyHostToDevice);
 
 	cudaMalloc((void**)&dev_fit, PARTICLE_COUNT * sizeof(int));
 	cudaMalloc((void**)&dev_weights, PARTICLE_COUNT * sizeof(float));
@@ -153,13 +129,22 @@ void particleFilterInit(Scene *scene) {
 	cudaMalloc((void**)&dev_freeCells, map_dim.x * map_dim.y * sizeof(bool));
 	cudaMalloc((void**)&dev_wallCells, map_dim.x * map_dim.y * sizeof(bool));
 
+	// initialize default cluster
+	Cluster	group1;
+	group1.id = 0;
+	group1.nodeIdx = 0;
+	group1.patchList.push_back(0);
+	group1.nodes.push_back(glm::vec2(0.0f, 0.0f));
+	std::vector<unsigned int> empty;
+	group1.edges.push_back(empty);
+	clusters.push_back(group1);
 
     checkCUDAError("particleFilterInit");
 }
 
 void particleFilterFree() {
     cudaFree(dev_image);  // no-op if dev_image is null
-	cudaFree(dev_geoms);
+	cudaFree(dev_maps);
 	cudaFree(dev_occupancyGrid);
 	cudaFree(dev_particles);
 	cudaFree(dev_lidar);
@@ -173,73 +158,6 @@ void particleFilterFree() {
     checkCUDAError("particleFilterFree");
 }
 
-// Display the occupancy grid
-__global__ void drawMap(int nPixels, glm::vec3 * image, Geom *objects, Camera cam, MAP_TYPE *occupancyGrid, glm::vec3 scale, glm::vec3 res)
-{
-	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
-	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
-
-	if (x < cam.resolution.x && y < cam.resolution.y) {
-		int index = x + (y * cam.resolution.x);
-		Geom map = objects[0];
-
-		// convert pixel coordinates to map coordates
-		float zoom = cam.position.z;
-		glm::vec2 mid((float)cam.resolution.x / 2.0f, (float) cam.resolution.y / 2.0f);
-		float xc = (x - mid.x + cam.position.x) / zoom;
-		float yc = (y - mid.y + cam.position.y) / zoom;
-
-		// check if pixel is in the map
-		if (xc < map.scale.x / 2 && xc > -map.scale.x / 2 && yc < map.scale.y / 2 && yc > -map.scale.y / 2) {
-			glm::ivec2 idx(
-				round(0.5f * scale.x / res.x + xc / res.x),
-				round(0.5f * scale.y / res.y + yc / res.y)
-			);
-
-			long max_val = 1 << (sizeof(MAP_TYPE)* 8 - 1);
-			float val = ((float)(occupancyGrid[idx.x * (int)(scale.x / res.x) + idx.y] + max_val)) / (max_val*2);
-			image[index] = glm::vec3(val);
-		}
-		else
-			image[index] = glm::vec3(1.0f);
-	}
-}
-
-// Display particles on screen
-__global__ void drawParticles(glm::vec3 * image, glm::vec4 *particles, Camera cam, glm::vec3 scale, glm::vec3 res) {
-	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
-
-	if (i < PARTICLE_COUNT) {
-		// convert map coordinates to pixel coordinates
-		float zoom = cam.position.z;
-		glm::vec2 mid((float)cam.resolution.x / 2.0f, (float)cam.resolution.y / 2.0f);
-		int x = particles[i].x * zoom + mid.x - cam.position.x;
-		int y = particles[i].y * zoom + mid.y - cam.position.y;
-
-		int l = cam.resolution.x;
-		int index = x + (y * l);
-
-		image[index] = glm::vec3(0.0f, 1.0f, 1.0f);
-	}
-}
-
-// display a box for robot position
-void drawRobot(glm::vec3 * image, glm::vec3 robot, Camera cam, glm::vec3 scale, glm::vec3 res) {
-	// convert map coordinates to pixel coordinates
-	float zoom = cam.position.z;
-	glm::vec2 mid((float)cam.resolution.x / 2.0f, (float)cam.resolution.y / 2.0f);
-	int x = robot.x * zoom + mid.x - cam.position.x;
-	int y = robot.y * zoom + mid.y - cam.position.y;
-
-	int l = cam.resolution.x;
-	int index = x + (y * l);
-	glm::vec3 color(1.0f, 0.0f, 0.0f);
-	glm::vec3 row[3] = { color, color, color };
-
-	cudaMemcpy(&image[index - 1], row, 3 * sizeof(glm::vec3), cudaMemcpyHostToDevice);
-	cudaMemcpy(&image[index - 1 + l], row, 3 * sizeof(glm::vec3), cudaMemcpyHostToDevice);
-	cudaMemcpy(&image[index - 1 - l], row, 3 * sizeof(glm::vec3), cudaMemcpyHostToDevice);
-}
 
 // rotates generates 2d point for lidar reading
 __device__ __host__ void CleanLidarScan(int n, const float scan, const float theta, glm::vec2 &intersection) {
@@ -250,10 +168,10 @@ __device__ __host__ void CleanLidarScan(int n, const float scan, const float the
 }
 
 //Bresenham's line algorithm for integer grid
-__device__ __host__ void traceRay(glm::ivec2 start, glm::ivec2 end, int rowLen, bool *out){
+__device__ __host__ void traceRay(glm::ivec2 start, glm::ivec2 end, glm::ivec2 map_dim, bool *out){
 	glm::ivec2 delta = end - start;
 
-	// swap for to the right octant
+	// swap to the right octant
 	bool steep = abs(delta.y) > abs(delta.x);
 	if (steep) { // check slope
 		int temp = start.x;
@@ -283,10 +201,15 @@ __device__ __host__ void traceRay(glm::ivec2 start, glm::ivec2 end, int rowLen, 
 
 	// build line
 	for (int x = start.x; x < end.x; x++){
-		if (steep) 
-			out[y*rowLen + x] = 1;
-		else 
-			out[x*rowLen + y] = 1;
+		int idx = 0;
+		if (steep)
+			idx  = y*map_dim.x + x;
+		else
+			idx = x*map_dim.x + y;
+
+		if (x < map_dim.x && y < map_dim.y && x >= 0 && y >= 0 && idx < map_dim.x * map_dim.y) { // assume square maps
+			out[idx] = 1;
+		}
 		
 		error -= deltay;
 		if (error < 0){
@@ -312,15 +235,15 @@ __device__ __host__ int mapCorrelation(int N, const MAP_TYPE *map, glm::ivec2 di
 	return retv;
 }
 
-__device__ __host__ int EvaluateParticle(MAP_TYPE *map, glm::ivec2 map_dim, Geom map_params, glm::vec4 &particle, glm::vec3 pos, float *lidar)
+__device__ __host__ int EvaluateParticle(MAP_TYPE *map, glm::ivec2 map_dim, Patch map_params, Particle &particle, glm::vec3 pos, float *lidar)
 {
 	// get walls relative to robot position, add particle position
 	glm::vec2 walls[LIDAR_SIZE];
 
 	for (int j = 0; j < LIDAR_SIZE; j++) {
-		CleanLidarScan(j, lidar[j], particle.z, walls[j]);
-		walls[j].x += particle.x;
-		walls[j].y += particle.y;
+		CleanLidarScan(j, lidar[j], particle.pos.z, walls[j]);
+		walls[j].x += particle.pos.x;
+		walls[j].y += particle.pos.y;
 
 		// convert to grid idx
 		walls[j].x = round(0.5f * map_params.scale.x / map_params.resolution.x + walls[j].x / map_params.resolution.x);
@@ -332,7 +255,7 @@ __device__ __host__ int EvaluateParticle(MAP_TYPE *map, glm::ivec2 map_dim, Geom
 }
 
 // kernel wrapper for calling Evaluate Particle
-__global__ void kernEvaluateParticles(MAP_TYPE *map, glm::ivec2 map_dim, Geom map_params, glm::vec4 *particles, glm::vec3 pos, float *lidar, int *fit)
+__global__ void kernEvaluateParticles(MAP_TYPE *map, glm::ivec2 map_dim, Patch map_params, Particle *particles, glm::vec3 pos, float *lidar, int *fit)
 {
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
@@ -342,12 +265,12 @@ __global__ void kernEvaluateParticles(MAP_TYPE *map, glm::ivec2 map_dim, Geom ma
 }
 
 // simple inplace multiplication kernel
-__global__ void kernUpdateWeights(int N, glm::vec4 *a, int *b, float c, int min)
+__global__ void kernUpdateWeights(int N, Particle *a, int *b, float c, int min)
 {
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
 	if (i < N) {
-		a[i].w = a[i].w * ((float) b[i] - min) * c;
+		a[i].w = a[i].w * ((float)b[i] - min) * c;
 	}
 }
 
@@ -383,7 +306,7 @@ glm::vec3 PFMeasurementUpdate(std::vector<float> lidar) {
 
 		// only use best point for return
 		cudaMemcpy(particles, dev_particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyDeviceToHost);
-		retv = (glm::vec3) particles[best];
+		retv = (glm::vec3) particles[best].pos;
 	}
 	else {
 		int best = -128 * LIDAR_SIZE;
@@ -413,14 +336,14 @@ glm::vec3 PFMeasurementUpdate(std::vector<float> lidar) {
 			}
 		}
 
-		retv = (glm::vec3) particles[iBest];
+		retv = (glm::vec3) particles[iBest].pos;
 	}
 
 	return retv;
 }
 
 // add noise to a single particle
-__device__ __host__ void ParticleAddNoise(glm::vec4 &particle, int frame, int idx)
+__device__ __host__ void ParticleAddNoise(Particle &particle, int frame, int idx)
 {
 	float mean[3] = { 0 };
 	float cov[3] = COV;		// covariance: x y theta
@@ -430,12 +353,12 @@ __device__ __host__ void ParticleAddNoise(glm::vec4 &particle, int frame, int id
 	thrust::random::normal_distribution<float> disty(mean[1], cov[1]);
 	thrust::random::normal_distribution<float> distt(mean[2], cov[2]);
 
-	glm::vec4 noise(distx(e2), disty(e2), distt(e2), 0.0f);
-	particle += noise;
+	glm::vec3 noise(distx(e2), disty(e2), distt(e2));
+	particle.pos += noise;
 }
 
 // kernel wrapper for adding noise to a particle
-__global__ void kernAddNoise(glm::vec4 *particles, int frame) 
+__global__ void kernAddNoise(Particle *particles, int frame)
 {
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
@@ -453,9 +376,9 @@ void PFMotionUpdate(int frame) {
 		const dim3 blocksPerGrid1d((PARTICLE_COUNT + blockSize1d - 1) / blockSize1d);
 
 		// sync up host and device arrays for now...
-		cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyHostToDevice);
+		cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(Particle), cudaMemcpyHostToDevice);
 		kernAddNoise << <blocksPerGrid1d, blockSize1d >> >(dev_particles, frame);
-		cudaMemcpy(particles, dev_particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyDeviceToHost);
+		cudaMemcpy(particles, dev_particles, PARTICLE_COUNT * sizeof(Particle), cudaMemcpyDeviceToHost);
 		cudaDeviceSynchronize(); 
 		
 		checkCUDAError("particle motion update error");
@@ -465,7 +388,7 @@ void PFMotionUpdate(int frame) {
 	}
 }
 
-__global__ void kernCopyWeights(glm::vec4 *particles, float *weights, bool squared) 
+__global__ void kernCopyWeights(Particle *particles, float *weights, bool squared)
 {
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
@@ -474,7 +397,7 @@ __global__ void kernCopyWeights(glm::vec4 *particles, float *weights, bool squar
 	}
 }
 
-__global__ void kernWeightedSample(glm::vec4 *particles, float *weights, float max, float Neff, int frame) 
+__global__ void kernWeightedSample(Particle *particles, float *weights, float max, float Neff, int frame)
 {
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
@@ -528,7 +451,7 @@ void PFResample(int frame) {
 			float max;
 			cudaMemcpy(&max, &dev_weights[PARTICLE_COUNT - 1], sizeof(float), cudaMemcpyDeviceToHost);
 			kernWeightedSample << <blocksPerGrid1d, blockSize1d >> >(dev_particles, dev_weights, max, Neff, frame);
-			cudaMemcpy(particles, dev_particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyDeviceToHost);
+			cudaMemcpy(particles, dev_particles, PARTICLE_COUNT * sizeof(Particle), cudaMemcpyDeviceToHost);
 
 			checkCUDAError("resample error");
 		}
@@ -554,7 +477,7 @@ void PFResample(int frame) {
 	} 
 
 	// push particles to GPU to draw
-	cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyHostToDevice);
+	cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(Particle), cudaMemcpyHostToDevice);
 }
 
 __global__ void kernUpdateMap(int N, MAP_TYPE *map, bool *mask, int val)
@@ -568,21 +491,29 @@ __global__ void kernUpdateMap(int N, MAP_TYPE *map, bool *mask, int val)
 	}
 }
 
-__global__ void kernGetWalls(float *lidar, glm::ivec2 center, float theta, bool *freeCells, bool *wallCells, glm::ivec2 map_dim, Geom map_params) 
+__global__ void kernGetWalls(float *lidar, glm::ivec2 center, float theta, bool *freeCells, bool *wallCells, glm::ivec2 map_dim, Patch map_params)
 {
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
 	if (i < LIDAR_SIZE) {
 		glm::vec2 walls;
 
+		//ego centric scan
 		CleanLidarScan(i, lidar[i], theta, walls);
-		walls.x = round(walls.x / map_params.resolution.x);
-		walls.y = round(walls.y / map_params.resolution.y);
-		walls += center;
 
-		if (walls.x >= 0 && walls.x < map_dim.x && walls.y >= 0 && walls.y < map_dim.y) {
-			traceRay(center, walls, map_dim.x, freeCells);
-			wallCells[(int) (walls.x * map_dim.x + walls.y)] = true;
+		// this will discard random bad data from sensor that was causing overflow errors
+		if (abs(walls.x) < LIDAR_RANGE && abs(walls.y) < LIDAR_RANGE) {
+			walls.x = round(walls.x / map_params.resolution.x);
+			walls.y = round(walls.y / map_params.resolution.y);
+
+			// center to robot pos in current map
+			walls += (glm::vec2) center;
+
+			// from here we need to check the wall bounds, determine if it needs to update multiple maps, and create a new patch if necessary.
+			traceRay(center, walls, map_dim, freeCells);
+			if (walls.x >= 0 && walls.x < map_dim.x && walls.y >= 0 && walls.y < map_dim.y) {
+				wallCells[(int)(walls.x * map_dim.x + walls.y)] = true;
+			}
 		}
 	}
 }
@@ -613,7 +544,6 @@ void PFUpdateMap(std::vector<float> lidar) {
 		// Update free/occupied weights
 		kernUpdateMap << <blocksPerGridMap, blockSize1d >> >(map_dim.x * map_dim.y, dev_occupancyGrid, dev_freeCells, FREE_WEIGHT);
 		kernUpdateMap << <blocksPerGridMap, blockSize1d >> >(map_dim.x * map_dim.y, dev_occupancyGrid, dev_wallCells, OCCUPIED_WEIGHT);
-
 	}
 	else {
 		// find occupancy grid cells from translated lidar
@@ -629,7 +559,7 @@ void PFUpdateMap(std::vector<float> lidar) {
 			walls[i] += center_idx;
 
 			if (walls[i].x >= 0 && walls[i].x < map_dim.x && walls[i].y >= 0 && walls[i].y < map_dim.y) {
-				traceRay(center_idx, walls[i], map_dim.x, freeCells);
+				traceRay(center_idx, walls[i], map_dim, freeCells);
 			}
 		}
 
@@ -660,13 +590,101 @@ void PFUpdateMap(std::vector<float> lidar) {
 	}
 }
 
+void CreateNode(unsigned int i) {
+	// create node at current position
+	clusters[i].nodes.push_back((glm::vec2) robotPos);
+
+	// add edge from new node to last node
+	std::vector<unsigned int> edge;
+	edge.push_back(clusters[i].nodeIdx);
+	clusters[i].edges.push_back(edge);
+
+	// add edge from last node to new node
+	clusters[i].edges[clusters[i].nodeIdx].push_back(clusters[i].nodes.size() - 1);
+
+	// update current node
+	clusters[i].nodeIdx = clusters[i].nodes.size() - 1;
+	printf("number of graph nodes: %i\n", clusters[i].nodes.size());
+
+}
+
+__global__ void CastVisibilityRays(int N, glm::vec2 a, glm::vec2 *b, bool *rayCells, glm::ivec2 map_dim, Patch map_params) {
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < N) {	
+		// convert from world coordinates to global map index
+		glm::ivec2 ai(
+			round(0.5f * map_dim.x + a.x / map_params.resolution.x + map_params.resolution.x / 2),
+			round(0.5f * map_dim.y + a.y / map_params.resolution.y + map_params.resolution.y / 2)
+			);
+
+		glm::ivec2 bi(
+			round(0.5f * map_dim.x + b[i].x / map_params.resolution.x + map_params.resolution.x / 2),
+			round(0.5f * map_dim.y + b[i].y / map_params.resolution.y + map_params.resolution.y / 2)
+			);
+
+		traceRay(ai, bi, map_dim, rayCells);
+	}
+}
+
+__global__ void CheckVisibility(int N, MAP_TYPE *map, bool *mask, bool *retv)
+{
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < N) {
+		if (mask[i])
+			*retv = *retv || (map[i] > WALL_CONFIDENCE);
+	}
+}
+
+void UpdateTopology() {
+	for (int i = 0; i < clusters.size(); i++) {
+		bool newNode = true;
+		// check if we need a new node on topology graph for each cluster (this is fast on CPU)
+		for (int j = 0; j < clusters[i].nodes.size(); j++)
+			newNode &= (glm::distance((glm::vec2) robotPos, clusters[i].nodes[j]) > TOPOLOGY_SPLIT);
+
+		if (newNode) CreateNode(i);
+
+		// if we don't need a new node for distance, check if we need one from visibility
+		if (!newNode) { // run this on GPU to prevent sending the maps back and forth, this operation can be slow even for a small graph
+			glm::vec2 *dev_nodes;
+			bool *dev_retv;
+			cudaMalloc((void**)&dev_nodes, clusters[i].nodes.size() * sizeof(glm::vec2));
+			cudaMalloc((void**)&dev_retv, sizeof(bool));
+			cudaMemcpy(dev_nodes, &clusters[i].nodes[0], clusters[i].nodes.size() * sizeof(glm::vec2), cudaMemcpyHostToDevice);
+			cudaMemset(dev_retv, 0, sizeof(bool));
+			cudaMemset(dev_freeCells, 0, map_dim.x * map_dim.y*sizeof(bool));
+
+			// 1D block for particles
+			const int blockSize1d = 128;
+			const dim3 blocksPerGridCluster((clusters[i].nodes.size() + blockSize1d - 1) / blockSize1d);
+			const dim3 blocksPerGridMap((map_dim.x * map_dim.y + blockSize1d - 1) / blockSize1d);
+
+			CastVisibilityRays << <blocksPerGridCluster, blockSize1d >> >(clusters[i].nodes.size(), (glm::vec2) robotPos, dev_nodes, dev_freeCells, map_dim, map_params);
+			cudaDeviceSynchronize();
+			CheckVisibility << <blocksPerGridMap, blockSize1d >> >(map_dim.x * map_dim.y, dev_occupancyGrid, dev_freeCells, dev_retv);
+			cudaDeviceSynchronize();
+
+			//for (int j = 0; j < clusters[i].nodes.size(); j++)
+			//	if (IsVisible((glm::vec2) robotPos, clusters[i].nodes[j])) obstructed = false;
+			
+			cudaFree(dev_nodes);
+			cudaFree(dev_retv);
+			
+			//if (obstructed) CreateNode(i);
+		}
+
+	}
+}
+
 /**
  * Wrapper for the __global__ call that sets up the kernel calls and does a ton
  * of memory management
  */
 void particleFilter(uchar4 *pbo, int frame, Lidar *lidar) {
 
-
+	// timing metrics
 	if (frame % 100 == 0) {
 		avg_motion = 0.0f;
 		avg_measurement = 0.0f;
@@ -697,6 +715,9 @@ void particleFilter(uchar4 *pbo, int frame, Lidar *lidar) {
 	avg_sample += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
 	start = end;
 
+	UpdateTopology();
+
+	// print timing metrics
 	if (frame % 100 == -1) {
 		cout << "Frame " << frame << ":" << endl;
 		printf("    motion:      %3.2f\n", avg_motion / 100.0f);
@@ -706,31 +727,7 @@ void particleFilter(uchar4 *pbo, int frame, Lidar *lidar) {
 	}
 }
 
-
-void drawMap(uchar4 *pbo)
-{
-	const Camera &cam = hst_scene->state.camera;
-	const int pixelcount = cam.resolution.x * cam.resolution.y;
-
-	// 2D block for generating pixels in camera
-	const dim3 blockSize2d(8, 8);
-	const dim3 blocksPerGrid2d(
-		(cam.resolution.x + blockSize2d.x - 1) / blockSize2d.x,
-		(cam.resolution.y + blockSize2d.y - 1) / blockSize2d.y);
-
-	const int blockSize1d = 128;
-	const dim3 blocksPerGrid1d((PARTICLE_COUNT + blockSize1d - 1) / blockSize1d);
-
-	drawMap << <blocksPerGrid2d, blockSize2d >> >(pixelcount, dev_image, dev_geoms, cam, dev_occupancyGrid, map_params.scale, map_params.resolution);
-	drawParticles << <blocksPerGrid1d, blockSize1d >> > (dev_image, dev_particles, cam, map_params.scale, map_params.resolution);
-	drawRobot(dev_image, robotPos, cam, map_params.scale, map_params.resolution);
+void drawMap(uchar4 *pbo) {
+	drawAll(pbo, PARTICLE_COUNT, hst_scene, dev_image, robotPos, dev_particles, dev_occupancyGrid, dev_maps, clusters);
 	checkCUDAError("draw screen error");
-
-
-	// Send results to OpenGL buffer for rendering
-	sendImageToPBO << <blocksPerGrid2d, blockSize2d >> >(pbo, cam.resolution, 1, dev_image);
-
-	// Retrieve image from GPU
-	cudaMemcpy(hst_scene->state.image.data(), dev_image,
-		pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
 }
