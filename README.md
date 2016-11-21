@@ -72,6 +72,9 @@ Currently, particle evaluation is run by sampling the value of the occupancy gri
 ## Section 3: Further Goals
 Depending on success of the RBPF, additional tests will be performed on publicly available 3D data sets. If initial results show promise, integration with the Intel Realsense Time of Flight RGB-D camera will be tested on an NVidia TK1 platform to benchmark performance on low-cost mobile platforms.
 
+For Milestone 2: Finish implementing RBPF
+
+For Milestone 3: Impelement KD-tree optimization and test in 3D
 
 <a name="appendix"/>
 ## Appendix: Build Instructions
