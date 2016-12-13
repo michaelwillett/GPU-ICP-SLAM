@@ -11,59 +11,46 @@
 #include <thrust/device_vector.h>
 #include <thrust/extrema.h>
 #include <thrust/partition.h>
+#include <thrust/reduce.h>
+#include <thrust/gather.h>
+#include <glm/glm.hpp>
+#include <glm/gtx/norm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include "sceneStructs.h"
 #include "scene.h"
-#include "glm/glm.hpp"
-#include "glm/gtx/norm.hpp"
+#include "svd3.h"
+#include "kdtree.hpp"
 #include "utilities.h"
 #include "draw.h"
 #include "kernel.h"
 
-// Function Device Control
-#define GPU_MOTION		1
-#define GPU_MEASUREMENT 1
-#define GPU_MAP			1
-#define GPU_RESAMPLE	1
 
 // Particle Filter Controls
-#define PARTICLE_COUNT 5000
+#define PARTICLE_COUNT 1000
 #define EFFECTIVE_PARTICLES .7
 #define FREE_WEIGHT -1
-#define OCCUPIED_WEIGHT 3
-#define TOPOLOGY_SPLIT 3.5f
-#define WALL_CONFIDENCE 50
+#define OCCUPIED_WEIGHT 4
+#define MAX_NODE_DIST 2.5f
+#define MIN_NODE_DIST .5f
+#define WALL_CONFIDENCE 30
+#define MIN_WALL_COUNT  2
+#define CLOSURE_MAP_DIST 6.0f
+#define CLOSURE_GRAPH_DIST 20.0f
 
 // Sensor Configuration
 #define LIDAR_ANGLE(i) (-135.0f + i * .25f) * PI / 180
 #define LIDAR_SIZE 1081
 #define LIDAR_RANGE 20.0f
-#define COV {0.015, 0.015, .015}
+#define COV {0.015, 0.015, .01}
 
 // GPU calculations
 #define BLOCK_SIZE 128
 
 // Helper Functions
 #define CLAMP(a, lo, hi) (a < lo) ? lo : (a > hi) ? hi : a
+#define ROUND_FRAC(a,frac) round((a/frac))*frac;
 
-
-/**
-* Handy-dandy hash function that provides seeds for random number generation.
-*/
-__host__ __device__ unsigned int utilhash(unsigned int a) {
-	a = (a + 0x7ed55d16) + (a << 12);
-	a = (a ^ 0xc761c23c) ^ (a >> 19);
-	a = (a + 0x165667b1) + (a << 5);
-	a = (a + 0xd3a2646c) ^ (a << 9);
-	a = (a + 0xfd7046c5) + (a << 3);
-	a = (a ^ 0xb55a4f09) ^ (a >> 16);
-	return a;
-}
-
-__host__ __device__ thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int depth) {
-	int h = utilhash((1 << 31) | (depth << 22) | iter) ^ utilhash(index);
-	return thrust::default_random_engine(h);
-}
 
 static Scene * hst_scene = NULL;
 static glm::vec3 * dev_image = NULL;
@@ -86,6 +73,34 @@ static float *dev_weights = NULL;
 static bool *dev_freeCells = NULL;
 static bool *dev_wallCells = NULL;
 
+// KD tree variables
+#define KD_MAX_SIZE 10000000
+static KDTree::Node *dev_kd = NULL;
+static KDTree::Node kd[KD_MAX_SIZE];
+static int kdSize = 0;
+static float *dev_dist = NULL;
+static int *dev_pair = NULL;
+static float *dev_fitf = NULL;
+
+
+/**
+* Handy-dandy hash function that provides seeds for random number generation.
+*/
+__host__ __device__ unsigned int utilhash(unsigned int a) {
+	a = (a + 0x7ed55d16) + (a << 12);
+	a = (a ^ 0xc761c23c) ^ (a >> 19);
+	a = (a + 0x165667b1) + (a << 5);
+	a = (a + 0xd3a2646c) ^ (a << 9);
+	a = (a + 0xfd7046c5) + (a << 3);
+	a = (a ^ 0xb55a4f09) ^ (a >> 16);
+	return a;
+}
+
+__host__ __device__ thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int depth) {
+	int h = utilhash((1 << 31) | (depth << 22) | iter) ^ utilhash(index);
+	return thrust::default_random_engine(h);
+}
+
 // timers
 float  avg_motion = 0.0f, avg_measurement = 0.0f, avg_map = 0.0f, avg_sample = 0.0f;
 
@@ -106,8 +121,7 @@ void particleFilterInit(Scene *scene) {
 
 	occupancyGrid = new MAP_TYPE[map_dim.x*map_dim.y];
 
-	long max_val = 1 << (sizeof(MAP_TYPE) * 8 - 1);
-	memset(occupancyGrid, -1*(max_val-1)*0, map_dim.x*map_dim.y*sizeof(MAP_TYPE));
+	memset(occupancyGrid, -100, map_dim.x*map_dim.y*sizeof(MAP_TYPE));
 
 	for (int i = 0; i < PARTICLE_COUNT; i++) {
 		particles[i].pos = glm::vec3(0.0f, 0.0f, 0.0f);
@@ -131,15 +145,19 @@ void particleFilterInit(Scene *scene) {
 
 	// initialize default cluster
 	Cluster	group1;
+	Node n0;
+	n0.pos = glm::vec2(0.0f);
+	n0.dist = 0.0f;
 	group1.id = 0;
 	group1.nodeIdx = 0;
 	group1.patchList.push_back(0);
-	group1.nodes.push_back(glm::vec2(0.0f, 0.0f));
+	group1.nodes.push_back(n0);
 	std::vector<unsigned int> empty;
 	group1.edges.push_back(empty);
 	clusters.push_back(group1);
 
     checkCUDAError("particleFilterInit");
+	particleFilterInitPC();
 }
 
 void particleFilterFree() {
@@ -154,8 +172,9 @@ void particleFilterFree() {
 	cudaFree(dev_wallCells);
 
 	delete occupancyGrid;
-
     checkCUDAError("particleFilterFree");
+
+	particleFilterFreePC();
 }
 
 
@@ -271,6 +290,16 @@ __global__ void kernUpdateWeights(int N, Particle *a, int *b, float c, int min)
 
 	if (i < N) {
 		a[i].w = a[i].w * ((float)b[i] - min) * c;
+	}
+}
+
+// simple inplace multiplication kernel
+__global__ void kernUpdateWeights(int N, Particle *a, float *b, float c, int min)
+{
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < N) {
+		a[i].w = a[i].w * (b[i] - min) * c;
 	}
 }
 
@@ -473,11 +502,12 @@ void PFResample(int frame) {
 				particles[i] = particles[idx];
 				particles[i].w = 1.0f;
 			}
+
+			// push particles to GPU to draw
+			cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(Particle), cudaMemcpyHostToDevice);
 		}
 	} 
 
-	// push particles to GPU to draw
-	cudaMemcpy(dev_particles, particles, PARTICLE_COUNT * sizeof(Particle), cudaMemcpyHostToDevice);
 }
 
 __global__ void kernUpdateMap(int N, MAP_TYPE *map, bool *mask, int val)
@@ -592,7 +622,17 @@ void PFUpdateMap(std::vector<float> lidar) {
 
 void CreateNode(unsigned int i) {
 	// create node at current position
-	clusters[i].nodes.push_back((glm::vec2) robotPos);
+	Node temp;
+	temp.pos = (glm::vec2) robotPos;
+	temp.dist = 0.0f;
+	float edgeLen = glm::distance(temp.pos, clusters[i].nodes[clusters[i].nodeIdx].pos);
+
+	// update distance for all current nodes
+	for (int j = 0; j < clusters[i].nodes.size(); j++) {
+		clusters[i].nodes[j].dist += edgeLen;
+	}
+
+	clusters[i].nodes.push_back(temp);
 
 	// add edge from new node to last node
 	std::vector<unsigned int> edge;
@@ -604,77 +644,153 @@ void CreateNode(unsigned int i) {
 
 	// update current node
 	clusters[i].nodeIdx = clusters[i].nodes.size() - 1;
-	printf("number of graph nodes: %i\n", clusters[i].nodes.size());
 
 }
 
-__global__ void CastVisibilityRays(int N, glm::vec2 a, glm::vec2 *b, bool *rayCells, glm::ivec2 map_dim, Patch map_params) {
-	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
-
-	if (i < N) {	
-		// convert from world coordinates to global map index
-		glm::ivec2 ai(
-			round(0.5f * map_dim.x + a.x / map_params.resolution.x + map_params.resolution.x / 2),
-			round(0.5f * map_dim.y + a.y / map_params.resolution.y + map_params.resolution.y / 2)
-			);
-
-		glm::ivec2 bi(
-			round(0.5f * map_dim.x + b[i].x / map_params.resolution.x + map_params.resolution.x / 2),
-			round(0.5f * map_dim.y + b[i].y / map_params.resolution.y + map_params.resolution.y / 2)
-			);
-
-		traceRay(ai, bi, map_dim, rayCells);
-	}
-}
-
-__global__ void CheckVisibility(int N, MAP_TYPE *map, bool *mask, bool *retv)
+// This returns true if it can see any walls
+__global__ void CheckVisibility(int N, MAP_TYPE *map, bool *mask, unsigned int *retv)
 {
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
 	if (i < N) {
-		if (mask[i])
-			*retv = *retv || (map[i] > WALL_CONFIDENCE);
+		if (mask[i] )
+			*retv += (map[i] > WALL_CONFIDENCE) ? 1 : 0;
 	}
+}
+
+int FindWalls(int clusterID, int nodeID) {
+	unsigned int *dev_retv;
+	bool *freeCells = new bool[map_dim.x * map_dim.y];
+	cudaMalloc((void**)&dev_retv, sizeof(unsigned int));
+	cudaMemset(dev_retv, 0, sizeof(unsigned int));
+	memset(freeCells, 0, map_dim.x * map_dim.y*sizeof(bool));
+
+	glm::ivec2 ai(
+		round(0.5f * map_dim.x + robotPos.x / map_params.resolution.x + map_params.resolution.x / 2),
+		round(0.5f * map_dim.y + robotPos.y / map_params.resolution.y + map_params.resolution.y / 2)
+		);
+
+	glm::ivec2 bi(
+		round(0.5f * map_dim.x + clusters[clusterID].nodes[nodeID].pos.x / map_params.resolution.x + map_params.resolution.x / 2),
+		round(0.5f * map_dim.y + clusters[clusterID].nodes[nodeID].pos.y / map_params.resolution.y + map_params.resolution.y / 2)
+		);
+
+	traceRay(ai, bi, map_dim, freeCells);
+	cudaMemcpy(dev_freeCells, freeCells, map_dim.x * map_dim.y*sizeof(bool), cudaMemcpyHostToDevice);
+
+	const int blockSize1d = 128;
+	const dim3 blocksPerGridMap((map_dim.x * map_dim.y + blockSize1d - 1) / blockSize1d);
+
+	CheckVisibility << <blocksPerGridMap, blockSize1d >> >(map_dim.x * map_dim.y, dev_occupancyGrid, dev_freeCells, dev_retv);
+	cudaDeviceSynchronize();
+
+	int nWalls;
+	cudaMemcpy(&nWalls, dev_retv, sizeof(int), cudaMemcpyDeviceToHost);
+
+	cudaFree(dev_retv);
+	delete freeCells;
+
+	return nWalls;
 }
 
 void UpdateTopology() {
 	for (int i = 0; i < clusters.size(); i++) {
 		bool newNode = true;
 		// check if we need a new node on topology graph for each cluster (this is fast on CPU)
+		// we could posibly improve performance here by not recalculating the distance every step, only checking relative to the distance the robot has moved.
 		for (int j = 0; j < clusters[i].nodes.size(); j++)
-			newNode &= (glm::distance((glm::vec2) robotPos, clusters[i].nodes[j]) > TOPOLOGY_SPLIT);
+			newNode &= (glm::distance((glm::vec2) robotPos, clusters[i].nodes[j].pos) > MAX_NODE_DIST);
 
-		if (newNode) CreateNode(i);
+		if (newNode) {
+			CreateNode(i);
+			printf("new node from distance. number of graph nodes: %i\n", clusters[i].nodes.size());
+		}
 
 		// if we don't need a new node for distance, check if we need one from visibility
 		if (!newNode) { // run this on GPU to prevent sending the maps back and forth, this operation can be slow even for a small graph
-			glm::vec2 *dev_nodes;
-			bool *dev_retv;
-			cudaMalloc((void**)&dev_nodes, clusters[i].nodes.size() * sizeof(glm::vec2));
-			cudaMalloc((void**)&dev_retv, sizeof(bool));
-			cudaMemcpy(dev_nodes, &clusters[i].nodes[0], clusters[i].nodes.size() * sizeof(glm::vec2), cudaMemcpyHostToDevice);
-			cudaMemset(dev_retv, 0, sizeof(bool));
-			cudaMemset(dev_freeCells, 0, map_dim.x * map_dim.y*sizeof(bool));
+			newNode = true;
 
 			// 1D block for particles
-			const int blockSize1d = 128;
-			const dim3 blocksPerGridCluster((clusters[i].nodes.size() + blockSize1d - 1) / blockSize1d);
-			const dim3 blocksPerGridMap((map_dim.x * map_dim.y + blockSize1d - 1) / blockSize1d);
-
-			CastVisibilityRays << <blocksPerGridCluster, blockSize1d >> >(clusters[i].nodes.size(), (glm::vec2) robotPos, dev_nodes, dev_freeCells, map_dim, map_params);
-			cudaDeviceSynchronize();
-			CheckVisibility << <blocksPerGridMap, blockSize1d >> >(map_dim.x * map_dim.y, dev_occupancyGrid, dev_freeCells, dev_retv);
-			cudaDeviceSynchronize();
-
-			//for (int j = 0; j < clusters[i].nodes.size(); j++)
-			//	if (IsVisible((glm::vec2) robotPos, clusters[i].nodes[j])) obstructed = false;
+			for (int j = 0; j < clusters[i].nodes.size(); j++) {
+				int nWalls = FindWalls(i, j);
+				//if (nWalls > 0) printf("found %i walls for node %i\n", nWalls, j);
+				newNode &= (nWalls >= MIN_WALL_COUNT);// && (glm::distance((glm::vec2) robotPos, clusters[i].nodes[j].pos) > MIN_NODE_DIST);
+			}
 			
-			cudaFree(dev_nodes);
-			cudaFree(dev_retv);
-			
-			//if (obstructed) CreateNode(i);
+			if (newNode) {
+				CreateNode(i);
+				printf("new node from visibility. number of graph nodes: %i\n", clusters[i].nodes.size());
+			}
 		}
+	}
+}
 
+__global__ void AssignParticlesToCluster(int N, Particle *particles) {
+
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < N) {
+		// find the closest visible node
+
+	}
+}
+
+void CheckLoopClosure() {
+	for (int i = 0; i < clusters.size(); i++) {
+		for (int j = 0; j < clusters[i].nodes.size(); j++) { // check each node for loop closure conditions
+
+			if (glm::distance((glm::vec2) robotPos, clusters[i].nodes[j].pos) < CLOSURE_MAP_DIST) {
+				float edgeLen = glm::distance((glm::vec2) robotPos, clusters[i].nodes[clusters[i].nodeIdx].pos);
+
+				if (edgeLen + clusters[i].nodes[j].dist > CLOSURE_GRAPH_DIST) {
+					//printf("potential loop closure with node %i\n", j);
+
+					// find all nodes that could separate clusters
+					// 1D block for particles
+					std::vector<int> visibleNodes;
+					for (int k = 0; k < clusters[i].nodes.size(); k++) {
+						int nWalls = FindWalls(i, k);
+
+						if (nWalls < MIN_WALL_COUNT) {
+							visibleNodes.push_back(k);
+						}
+					}
+
+					// create new clusters for each group of visible nodes
+					for (int k = 0; k < visibleNodes.size(); k++) {
+						for (int l = 0; l < clusters.size(); l++) {
+							std::vector<unsigned int> v = clusters[l].edges[visibleNodes[k]];		// only create new cluster if no clusters have an edge between visible and current nodes
+							bool createCluster = (std::find(v.begin(), v.end(), clusters[i].nodeIdx) != v.end());
+
+							if (createCluster) {		
+								// copy cluster and get a new ID for it
+								Cluster newCluster = clusters[i];
+								newCluster.id = clusters.size();	// this will be wrong when we start deleting obsolete clusters
+
+								// add edges
+								newCluster.edges[clusters[i].nodeIdx].push_back(visibleNodes[k]);
+								newCluster.edges[visibleNodes[k]].push_back(clusters[i].nodeIdx);
+
+								// update graph distances for all nodes in cluster
+
+								//clusters.push_back(newCluster);
+							}
+
+						}
+					}
+					
+
+					// parse all particles into correct cluster
+					//const int blockSize1d = 128;
+					//const dim3 blocksPerGrid1d((PARTICLE_COUNT + blockSize1d - 1) / blockSize1d);
+					//AssignParticlesToCluster << <blocksPerGrid1d, blockSize1d >> >(PARTICLE_COUNT, dev_particles);
+
+					// prune unused clusters
+					printf("now contains %i clusters\n", clusters.size());
+				}
+
+			}
+		}
 	}
 }
 
@@ -683,51 +799,701 @@ void UpdateTopology() {
  * of memory management
  */
 void particleFilter(uchar4 *pbo, int frame, Lidar *lidar) {
+	particleFilterPC(frame, lidar);
 
-	// timing metrics
-	if (frame % 100 == 0) {
-		avg_motion = 0.0f;
-		avg_measurement = 0.0f;
-		avg_map = 0.0f;
-		avg_sample = 0.0f;
-	}
 
-	std::chrono::time_point<std::chrono::system_clock> start, end;
-	
-	start = std::chrono::system_clock::now();
-	PFMotionUpdate(frame);
-	end = std::chrono::system_clock::now();
-	avg_motion += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	start = end;
+	//// timing metrics
+	//if (frame % 100 == 0) {
+	//	avg_motion = 0.0f;
+	//	avg_measurement = 0.0f;
+	//	avg_map = 0.0f;
+	//	avg_sample = 0.0f;
+	//}
 
-	robotPos = PFMeasurementUpdate(lidar->scans[frame]);
-	end = std::chrono::system_clock::now();
-	avg_measurement += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	start = end;
-	
-	PFUpdateMap(lidar->scans[frame]);
-	end = std::chrono::system_clock::now();
-	avg_map += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	start = end;
-	
-	PFResample(frame);
-	end = std::chrono::system_clock::now();
-	avg_sample += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	start = end;
+	//std::chrono::time_point<std::chrono::system_clock> start, end;
+	//
+	//start = std::chrono::system_clock::now();
+	//PFMotionUpdate(frame);
+	//end = std::chrono::system_clock::now();
+	//avg_motion += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+	//start = end;
 
-	UpdateTopology();
+	//robotPos = PFMeasurementUpdate(lidar->scans[frame]);
+	//end = std::chrono::system_clock::now();
+	//avg_measurement += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+	//start = end;
+	//
+	//PFUpdateMap(lidar->scans[frame]);
+	//end = std::chrono::system_clock::now();
+	//avg_map += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+	//start = end;
+	//
+	//PFResample(frame);
+	//end = std::chrono::system_clock::now();
+	//avg_sample += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+	//start = end;
 
-	// print timing metrics
-	if (frame % 100 == -1) {
-		cout << "Frame " << frame << ":" << endl;
-		printf("    motion:      %3.2f\n", avg_motion / 100.0f);
-		printf("    measurement: %3.2f\n", avg_measurement / 100.0f);
-		printf("    map:         %3.2f\n", avg_map / 100.0f);
-		printf("    resample:    %3.2f\n", avg_sample / 100.0f);
-	}
+	//UpdateTopology();
+	//CheckLoopClosure();
+
+	//// print timing metrics
+	//if (frame % 100 == -1) {
+	//	cout << "Frame " << frame << ":" << endl;
+	//	printf("    motion:      %3.2f\n", avg_motion / 100.0f);
+	//	printf("    measurement: %3.2f\n", avg_measurement / 100.0f);
+	//	printf("    map:         %3.2f\n", avg_map / 100.0f);
+	//	printf("    resample:    %3.2f\n", avg_sample / 100.0f);
+	//}
 }
 
 void drawMap(uchar4 *pbo) {
 	drawAll(pbo, PARTICLE_COUNT, hst_scene, dev_image, robotPos, dev_particles, dev_occupancyGrid, dev_maps, clusters);
 	checkCUDAError("draw screen error");
+}
+
+void getPCData(Particle **ptrParticles, MAP_TYPE **ptrMap, KDTree::Node **ptrKD, int *nParticles, int *nKD, glm::vec3 &pos) {
+	// copy map to host so PCL can draw it
+	cudaMemcpy(occupancyGrid, dev_occupancyGrid, map_dim.x*map_dim.y * sizeof(MAP_TYPE), cudaMemcpyDeviceToHost);
+	*ptrParticles = particles;
+	*ptrMap = occupancyGrid;
+	*nParticles = PARTICLE_COUNT;
+
+	*ptrKD = kd;
+	*nKD = kdSize;
+	pos = robotPos;
+}
+
+
+/**
+* Begin ICP code.
+*/
+
+
+__host__ __device__ bool sortFuncX(const glm::vec4 &p1, const glm::vec4 &p2)
+{
+	return p1.x < p2.x;
+}
+__host__ __device__ bool sortFuncY(const glm::vec4 &p1, const glm::vec4 &p2)
+{
+	return p1.y < p2.y;
+}
+__host__ __device__ bool sortFuncZ(const glm::vec4 &p1, const glm::vec4 &p2)
+{
+	return p1.z < p2.z;
+}
+
+__global__ void transformPoint(int N, glm::vec4 *points, glm::mat4 transform) {
+	int index = threadIdx.x + (blockIdx.x * blockDim.x);
+	if (index >= N) {
+		return;
+	}
+
+	points[index] = glm::vec4(glm::vec3(transform * glm::vec4(glm::vec3(points[index]), 1)), 1);
+}
+
+__device__ float getHyperplaneDist(const glm::vec4 *pt1, const glm::vec4 *pt2, int axis, bool *branch)
+{
+	float retv = 0.0f;
+	if (axis == 0) {
+		*branch = sortFuncX(*pt1, *pt2);
+		retv = abs(pt1->x - pt2->x);
+	}
+	if (axis == 1) {
+		*branch = sortFuncY(*pt1, *pt2);
+		retv = abs(pt1->y - pt2->y);
+	}
+	if (axis == 2) {
+		*branch = sortFuncZ(*pt1, *pt2);
+		retv = abs(pt1->z - pt2->z);
+	}
+
+	return retv;
+}
+
+__global__ void outerProduct(int N, const glm::vec4 *vec1, const glm::vec4 *vec2, glm::mat3 *out)
+{
+	int i = threadIdx.x + (blockIdx.x * blockDim.x);
+	if (i >= N) {
+		return;
+	}
+
+	out[i] = glm::mat3(glm::vec3(vec1[i]) * vec2[i].x,
+		glm::vec3(vec1[i]) * vec2[i].y,
+		glm::vec3(vec1[i] * vec2[i].z));
+}
+
+__global__ void findCorrespondenceKD(int N, int sizeScene, glm::vec4 *cor, const glm::vec4 *points, const KDTree::Node* tree)
+{
+	int i = threadIdx.x + (blockIdx.x * blockDim.x);
+	if (i >= N) {
+		return;
+	}
+
+	glm::vec4 pt = points[i + sizeScene];
+	float bestDist = glm::distance(glm::vec3(pt), glm::vec3(tree[0].value));
+	int bestIdx = 0;
+	int head = 0;
+	bool done = false;
+	bool branch = false;
+	bool nodeFullyExplored = false;
+
+	while (!done) {
+		// depth first on current branch
+		while (head >= 0) {
+			// check the current node
+			const KDTree::Node test = tree[head];
+			float d = glm::distance(glm::vec3(pt), glm::vec3(test.value));
+			if (d < bestDist) {
+				bestDist = d;
+				bestIdx = head;
+				nodeFullyExplored = false;
+			}
+
+			// find branch path
+			getHyperplaneDist(&pt, &test.value, test.axis, &branch);
+			head = branch ? test.left : test.right;
+		}
+
+		if (nodeFullyExplored) {
+			done = true;
+		}
+		else {
+			// check if parent of best node could have better values on other branch
+			const KDTree::Node parent = tree[tree[bestIdx].parent];
+			if (getHyperplaneDist(&pt, &parent.value, parent.axis, &branch) < bestDist) {
+				head = !branch ? parent.left : parent.right;
+				nodeFullyExplored = true;
+			}
+			else
+				done = true;
+		}
+	}
+
+	cor[i] = tree[bestIdx].value;
+}
+
+__global__ void findCorrespondenceIndexKD(int N, int *cor, const glm::vec4 *points, const KDTree::Node* tree)
+{
+	int i = threadIdx.x + (blockIdx.x * blockDim.x);
+	if (i >= N) {
+		return;
+	}
+
+	glm::vec4 pt = points[i];
+	float bestDist = glm::distance(glm::vec3(pt), glm::vec3(tree[0].value));
+	int bestIdx = 0;
+	int head = 0;
+	bool done = false;
+	bool branch = false;
+	bool nodeFullyExplored = false;
+
+	while (!done) {
+		// depth first on current branch
+		while (head >= 0) {
+			// check the current node
+			const KDTree::Node test = tree[head];
+			float d = glm::distance(glm::vec3(pt), glm::vec3(test.value));
+			if (d < bestDist) {
+				bestDist = d;
+				bestIdx = head;
+				nodeFullyExplored = false;
+			}
+
+			// find branch path
+			getHyperplaneDist(&pt, &test.value, test.axis, &branch);
+			head = branch ? test.left : test.right;
+		}
+
+		if (nodeFullyExplored) {
+			done = true;
+		}
+		else {
+			// check if parent of best node could have better values on other branch
+			const KDTree::Node parent = tree[tree[bestIdx].parent];
+			if (getHyperplaneDist(&pt, &parent.value, parent.axis, &branch) < bestDist) {
+				head = !branch ? parent.left : parent.right;
+				nodeFullyExplored = true;
+			}
+			else
+				done = true;
+		}
+	}
+
+	cor[i] = bestIdx;
+}
+
+__global__ void kernGetWallsKD(float *lidar, glm::vec3 robotPos, glm::vec4 *nodeVal, Patch map_params)
+{
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < LIDAR_SIZE) {
+		//ego centric scan
+		glm::vec2 walls;
+		CleanLidarScan(i, lidar[i], robotPos.z, walls);
+
+		// this will discard random bad data from sensor that was causing overflow errors
+		if (abs(walls.x) < LIDAR_RANGE && abs(walls.y) < LIDAR_RANGE) {
+			nodeVal[i].x = robotPos.x + walls.x, map_params.resolution.x;
+			nodeVal[i].y = robotPos.y + walls.y, map_params.resolution.y;
+			nodeVal[i].z = 0.0f;
+			nodeVal[i].w = OCCUPIED_WEIGHT;
+		}
+	}
+}
+
+glm::vec3 transformPointICP(glm::vec3 start, std::vector<float> lidar) {
+	int sizeTarget = LIDAR_SIZE;
+	int sizeScene = kdSize;
+	glm::vec3 retv = start;
+	
+	dim3 fullBlocksPerGrid((LIDAR_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	// find the closest point in the scene for each point in the target
+
+	glm::vec4 *dev_cor, *tar_c, *cor_c, *dev_target;
+	glm::mat3 *dev_W;
+
+	cudaMalloc((void**)&dev_cor, sizeTarget*sizeof(glm::vec4));
+	cudaMalloc((void**)&tar_c, sizeTarget*sizeof(glm::vec4));
+	cudaMalloc((void**)&cor_c, sizeTarget*sizeof(glm::vec4));
+	cudaMalloc((void**)&dev_target, sizeTarget*sizeof(glm::vec4));
+	cudaMalloc((void**)&dev_W, sizeTarget * sizeof(glm::mat3));
+	cudaMemset(dev_W, 0, sizeTarget * sizeof(glm::mat3));
+
+	// find intersections from lidar scan
+	cudaMemcpy(dev_lidar, &lidar[0], LIDAR_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+	//kernGetWalls << <fullBlocksPerGrid, BLOCK_SIZE >> >(dev_lidar, center_idx, robotPos.z, dev_freeCells, dev_wallCells, map_dim, map_params);
+	kernGetWallsKD << <fullBlocksPerGrid, BLOCK_SIZE >> >(dev_lidar, robotPos, dev_target, map_params);
+
+	findCorrespondenceKD << <fullBlocksPerGrid, BLOCK_SIZE >> >(sizeTarget, sizeScene, dev_cor, dev_target, dev_kd);
+	cudaThreadSynchronize();
+
+	// Calculate mean centered correspondenses 
+	glm::vec3 mu_tar(0, 0, 0), mu_cor(0, 0, 0);
+
+	thrust::device_ptr<glm::vec4> ptr_target(dev_target);
+	thrust::device_ptr<glm::vec4> ptr_scene(dev_target);
+	thrust::device_ptr<glm::vec4> ptr_cor(dev_cor);
+
+	mu_tar = glm::vec3(thrust::reduce(ptr_target, ptr_target + sizeTarget, glm::vec4(0, 0, 0, 0)));
+	mu_cor = glm::vec3(thrust::reduce(ptr_cor, ptr_cor + sizeTarget, glm::vec4(0, 0, 0, 0)));
+
+	mu_tar /= sizeTarget;
+	mu_cor /= sizeTarget;
+
+	cudaMemcpy(tar_c, dev_target, sizeTarget*sizeof(glm::vec4), cudaMemcpyDeviceToDevice);
+	cudaMemcpy(cor_c, dev_cor, sizeTarget*sizeof(glm::vec4), cudaMemcpyDeviceToDevice);
+	checkCUDAError("mean centered calculation failed!");
+
+	// move the point cloud with translation
+	glm::vec3 r(0, 0, 0);
+	glm::vec3 s(1, 1, 1);
+	glm::mat4 center_tar = utilityCore::buildTransformationMatrix(-mu_tar, r, s);
+	glm::mat4 center_cor = utilityCore::buildTransformationMatrix(-mu_cor, r, s);
+
+	transformPoint << <fullBlocksPerGrid, BLOCK_SIZE >> >(sizeTarget, tar_c, center_tar);
+	transformPoint << <fullBlocksPerGrid, BLOCK_SIZE >> >(sizeTarget, cor_c, center_cor);
+
+	checkCUDAError("mean centered transformation failed!");
+	cudaThreadSynchronize();
+
+	// Calculate W
+	outerProduct << <fullBlocksPerGrid, BLOCK_SIZE >> >(sizeTarget, tar_c, cor_c, dev_W);
+	thrust::device_ptr<glm::mat3> ptr_W(dev_W);
+	glm::mat3 W = thrust::reduce(ptr_W, ptr_W + sizeTarget, glm::mat3(0));
+
+	checkCUDAError("outer product failed!");
+	cudaThreadSynchronize();
+
+	// calculate SVD of W
+	glm::mat3 U, S, V;
+
+	svd(W[0][0], W[0][1], W[0][2], W[1][0], W[1][1], W[1][2], W[2][0], W[2][1], W[2][2],
+		U[0][0], U[0][1], U[0][2], U[1][0], U[1][1], U[1][2], U[2][0], U[2][1], U[2][2],
+		S[0][0], S[0][1], S[0][2], S[1][0], S[1][1], S[1][2], S[2][0], S[2][1], S[2][2],
+		V[0][0], V[0][1], V[0][2], V[1][0], V[1][1], V[1][2], V[2][0], V[2][1], V[2][2]
+		);
+
+
+	glm::mat3 g_U(glm::vec3(U[0][0], U[1][0], U[2][0]), glm::vec3(U[0][1], U[1][1], U[2][1]), glm::vec3(U[0][2], U[1][2], U[2][2]));
+	glm::mat3 g_Vt(glm::vec3(V[0][0], V[0][1], V[0][2]), glm::vec3(V[1][0], V[1][1], V[1][2]), glm::vec3(V[2][0], V[2][1], V[2][2]));
+
+	// Get transformation from SVD
+	glm::mat3 R = g_U * g_Vt;
+	glm::vec3 t = glm::vec3(mu_cor) - R*glm::vec3(mu_tar);
+
+	// update target points
+	//glm::mat4 transform = glm::translate(glm::mat4(), t) * glm::mat4(R);
+	//transformPoint << <fullBlocksPerGrid, BLOCK_SIZE >> >(sizeTarget, dev_target, transform);
+
+	// make a massive assumption that the SVD will already result in a 2d rotation around the z-axis
+	//glm::vec4 newPoint(start.x, start.y, 0.0f, 0.0f);
+	//newPoint = transform*newPoint;
+	float theta = asin(R[0][1]);
+
+	retv.x += t.x;
+	retv.y += t.y;
+	retv.z += theta;
+
+	cudaFree(dev_cor);
+	cudaFree(tar_c);
+	cudaFree(cor_c);
+	cudaFree(dev_W);
+	cudaFree(dev_target);
+
+	return retv;
+}
+
+
+void particleFilterInitPC() {
+	// KD tree data
+	cudaMalloc((void**)&dev_dist, LIDAR_SIZE * sizeof(float));
+	checkCUDAError("cudaMalloc dev_dist failed!");
+
+	cudaMalloc((void**)&dev_pair, LIDAR_SIZE * sizeof(int));
+	checkCUDAError("cudaMalloc dev_pair failed!");
+
+	cudaMalloc((void**)&dev_kd, KD_MAX_SIZE * sizeof(KDTree::Node));
+	checkCUDAError("cudaMalloc dev_kd failed!");
+
+	cudaMalloc((void**)&dev_fitf, PARTICLE_COUNT * sizeof(float));
+	checkCUDAError("cudaMalloc dev_fitf failed!");
+
+
+	cudaThreadSynchronize();
+	checkCUDAError("particleFilterInitPC");
+}
+
+void particleFilterFreePC() {
+	cudaFree(dev_dist);
+	cudaFree(dev_pair);
+	cudaFree(dev_kd);
+	cudaFree(dev_fitf);
+
+	checkCUDAError("particleFilterFreePC");
+}
+
+
+__device__ float EvaluateParticleKD(MAP_TYPE *map, glm::ivec2 map_dim, Patch map_params, Particle &particle, glm::vec3 pos, float *lidar, KDTree::Node *kdTree, int kdSize)
+{
+	// get walls relative to robot position, add particle position
+	glm::vec2 walls;
+	glm::vec4 pt;
+
+	int nValid = 0;
+	glm::vec3 mu_tar(0.0f);
+	glm::vec3 mu_cor(0.0f);
+	float retv = 0.0f;
+
+	// get walls and find correspondence
+	for (int j = 0; j < LIDAR_SIZE; j++) {
+		CleanLidarScan(j, lidar[j], particle.pos.z, walls);
+
+		if (abs(walls.x) < LIDAR_RANGE && abs(walls.y) < LIDAR_RANGE) {
+			walls.x += particle.pos.x;
+			walls.y += particle.pos.y;
+
+			pt.x = walls.x;
+			pt.y = walls.y;
+			pt.z = 0.0f;
+			pt.w = 0.0f;
+
+			float bestDist = glm::distance(glm::vec3(pt), glm::vec3(kdTree[0].value));
+			int bestIdx = 0;
+			int head = 0;
+			bool done = false;
+			bool branch = false;
+			bool nodeFullyExplored = false;
+
+			while (!done) {
+				// depth first on current branch
+				while (head >= 0) {
+					// check the current node
+					const KDTree::Node test = kdTree[head];
+					float d = glm::distance(glm::vec3(pt), glm::vec3(test.value));
+					if (d < bestDist) {
+						bestDist = d;
+						bestIdx = head;
+						nodeFullyExplored = false;
+					}
+
+					// find branch path
+					getHyperplaneDist(&pt, &test.value, test.axis, &branch);
+					head = branch ? test.left : test.right;
+				}
+
+				if (nodeFullyExplored) {
+					done = true;
+				}
+				else {
+					// check if parent of best node could have better values on other branch
+					const KDTree::Node parent = kdTree[kdTree[bestIdx].parent];
+					if (getHyperplaneDist(&pt, &parent.value, parent.axis, &branch) < bestDist) {
+						head = !branch ? parent.left : parent.right;
+						nodeFullyExplored = true;
+					}
+					else
+						done = true;
+				}
+			}
+
+			mu_tar += (glm::vec3) pt;
+			mu_cor += (glm::vec3) kdTree[bestIdx].value;
+
+			float minDist = sqrt(map_params.resolution.x*map_params.resolution.x + map_params.resolution.y*map_params.resolution.y) * 2;
+
+			//if (glm::distance((glm::vec3) pt, (glm::vec3) kdTree[bestIdx].value) < minDist) {
+				retv += kdTree[bestIdx].value.w;
+				nValid++;
+			//}
+		} 
+	}
+
+	//printf("matches found: %i %.4f\n", nValid, retv);
+
+	//mu_tar /= nValid;
+	//mu_cor /= nValid;
+
+	return retv;
+}
+
+// kernel wrapper for calling Evaluate Particle
+__global__ void kernEvaluateParticlesKD(MAP_TYPE *map, glm::ivec2 map_dim, Patch map_params, Particle *particles, glm::vec3 pos, float *lidar, float *fit, KDTree::Node *kdTree, int kdSize)
+{
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < PARTICLE_COUNT) {
+		fit[i] = EvaluateParticleKD(map, map_dim, map_params, particles[i], pos, lidar, kdTree, kdSize);
+	}
+}
+
+// update particle cloud weights from measurement
+glm::vec3 PFMeasurementUpdateKD(std::vector<float> lidar) {
+	glm::vec3 retv(0.0f);
+
+	// 1D block for particles
+	const int blockSize1d = 128;
+	const dim3 blocksPerGrid1d((PARTICLE_COUNT + blockSize1d - 1) / blockSize1d);
+
+	// create device copy of fit array and lidar
+	cudaMemcpy(dev_lidar, &lidar[0], LIDAR_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemset(dev_fitf, 0, PARTICLE_COUNT * sizeof(float));
+	cudaDeviceSynchronize();
+
+	kernEvaluateParticlesKD << <blocksPerGrid1d, blockSize1d >> >(dev_occupancyGrid, map_dim, map_params, dev_particles, robotPos, dev_lidar, dev_fitf, dev_kd, kdSize);
+	cudaDeviceSynchronize();
+	checkCUDAError("particle measurement kd tree update error");
+
+	thrust::device_vector<float> vFit(dev_fitf, dev_fitf + PARTICLE_COUNT);
+	thrust::pair<thrust::device_vector<float>::iterator, thrust::device_vector<float>::iterator> result = thrust::minmax_element(vFit.begin(), vFit.end());
+	float rng = *result.second - *result.first;
+	int best = result.second - vFit.begin();
+
+	// rescale all weights
+	if (rng > 0.0f) {
+		float f = 1 / rng;
+		kernUpdateWeights << <blocksPerGrid1d, blockSize1d >> >(PARTICLE_COUNT, dev_particles, dev_fitf, f, *result.first);
+		cudaDeviceSynchronize();
+		checkCUDAError("particle weight kdtree update error");
+	}
+
+	// only use best point for return
+	cudaMemcpy(particles, dev_particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyDeviceToHost);
+	retv = (glm::vec3) particles[best].pos;
+
+	// run ICP on final point only
+	//retv = transformPointICP((glm::vec3) particles[best].pos, lidar);
+	retv = (glm::vec3) particles[best].pos;
+
+	//printf("pos: %.4f %.4f %.4f\n", retv.x, retv.y, retv.z);
+
+	return retv;
+}
+
+__global__ void kernUpdateMapKD(int N, KDTree::Node* tree, glm::vec4 *target, int *indexList, int val, Patch map_params)
+{
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < N) {
+		long clamp_val = (1 << (sizeof(MAP_TYPE) * 8 - 1)) - 15;
+		glm::vec3 a = (glm::vec3) target[i];
+		glm::vec3 b = (glm::vec3) tree[indexList[i]].value;
+		float minDist = sqrt(map_params.resolution.x*map_params.resolution.x + map_params.resolution.y*map_params.resolution.y);
+
+		if (glm::distance(a, b) < minDist) {
+			tree[indexList[i]].value.w = CLAMP(tree[indexList[i]].value.w + val, -clamp_val, clamp_val);
+		}
+	}
+}
+
+
+__global__ void kernTestCorrespondance(int N, KDTree::Node* tree, glm::vec4 *target, int *indexList, bool *diff, Patch map_params)
+{
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < N) {
+		glm::vec3 a = (glm::vec3) target[i];
+		glm::vec3 b = (glm::vec3) tree[indexList[i]].value;
+		float minDist = sqrt(map_params.resolution.x*map_params.resolution.x + map_params.resolution.y*map_params.resolution.y) / 2.0f;
+
+
+		diff[i] = (glm::distance(a, b) > minDist);
+	}
+}
+
+
+
+void PFUpdateMapKD(std::vector<float> lidar) {
+	// get local free and occupied grid cells here. Use these values to update pointcloud
+	glm::ivec2 center_idx(
+		round(0.5f * map_dim.x + map_params.resolution.x / 2),
+		round(0.5f * map_dim.y + map_params.resolution.y / 2)
+		);
+	
+	// 1D block for particles
+	const int blockSize1d = 128;
+	const dim3 blocksPerGridLidar((LIDAR_SIZE + blockSize1d - 1) / blockSize1d);
+
+	// find occupancy grid cells from translated lidar
+	cudaMemset(dev_freeCells, 0, map_dim.x * map_dim.y*sizeof(bool));
+	cudaMemset(dev_wallCells, 0, map_dim.x * map_dim.y*sizeof(bool));
+	cudaMemcpy(dev_lidar, &lidar[0], LIDAR_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+
+	// find intersections from lidar scan
+	kernGetWalls << <blocksPerGridLidar, blockSize1d >> >(dev_lidar, center_idx, robotPos.z, dev_freeCells, dev_wallCells, map_dim, map_params);
+
+	bool *wallCells = new bool[map_dim.x * map_dim.y];
+	bool *freeCells = new bool[map_dim.x * map_dim.y];
+	std::vector<glm::vec4> wallPC;
+	std::vector<glm::vec4> freePC;
+
+	cudaMemcpy(wallCells, dev_wallCells, map_dim.x * map_dim.y * sizeof(bool), cudaMemcpyDeviceToHost);
+	cudaMemcpy(freeCells, dev_freeCells, map_dim.x * map_dim.y * sizeof(bool), cudaMemcpyDeviceToHost);
+	
+	// Create Pointclouds here
+	// parallelize through compactions and summation
+	for (int x = 0; x < map_dim.x; x++) {
+		for (int y = 0; y < map_dim.y; y++) {
+			int idx = (x * map_dim.x) + y;
+
+			if (wallCells[idx]) {
+				glm::vec4 point;
+
+				point.x = x * map_params.resolution.x - map_params.scale.x / 2.0f + robotPos.x;
+				point.y = y * map_params.resolution.y - map_params.scale.y / 2.0f + robotPos.y;
+				point.x = ROUND_FRAC(point.x, map_params.resolution.x);
+				point.y = ROUND_FRAC(point.y, map_params.resolution.y);
+				point.z = 0.0f;
+				wallPC.push_back(point);
+			}
+
+			if (freeCells[idx]) {
+				glm::vec4 point;
+
+				point.x = x * map_params.resolution.x - map_params.scale.x / 2.0f + robotPos.x;
+				point.y = y * map_params.resolution.y - map_params.scale.y / 2.0f + robotPos.y;
+				point.x = ROUND_FRAC(point.x, map_params.resolution.x);
+				point.y = ROUND_FRAC(point.y, map_params.resolution.y);
+				point.z = 0.0f;
+				freePC.push_back(point);
+			}
+		}
+	}
+
+	if (kdSize > 0) {
+		// downweight existing wall cells if in freeCells
+		const dim3 blocksPerGridFree((freePC.size() + blockSize1d - 1) / blockSize1d);
+		const dim3 blocksPerGridWall((wallPC.size() + blockSize1d - 1) / blockSize1d);
+
+		glm::vec4 *dev_walls, *dev_free;
+		int *dev_walls_c, *dev_free_c;
+		cudaMalloc((void**)&dev_walls, wallPC.size()*sizeof(glm::vec4));
+		cudaMalloc((void**)&dev_walls_c, wallPC.size()*sizeof(int));
+		cudaMalloc((void**)&dev_free, freePC.size()*sizeof(glm::vec4));
+		cudaMalloc((void**)&dev_free_c, freePC.size()*sizeof(int));
+
+		cudaMemcpy(dev_free, &freePC[0], wallPC.size()*sizeof(glm::vec4), cudaMemcpyHostToDevice);
+		cudaMemcpy(dev_walls, &wallPC[0], wallPC.size()*sizeof(glm::vec4), cudaMemcpyHostToDevice);
+
+		findCorrespondenceIndexKD << <blocksPerGridFree, BLOCK_SIZE >> >(freePC.size(), dev_free_c, dev_free, dev_kd);
+		findCorrespondenceIndexKD << <blocksPerGridWall, BLOCK_SIZE >> >(wallPC.size(), dev_walls_c, dev_walls, dev_kd);
+
+		cudaDeviceSynchronize();
+		checkCUDAError("map update - correspondance failure");
+
+		bool *wallsCreate = new bool[wallPC.size()];
+		bool *dev_wallsCreate = NULL;
+		cudaMalloc((void**)&dev_wallsCreate, wallPC.size()*sizeof(bool));
+
+		//cudaMemcpy(free_c, &freePC[0], freePC.size()*sizeof(int), cudaMemcpyHostToDevice);
+		//cudaMemcpy(walls_c, &wallPC[0], wallPC.size()*sizeof(int), cudaMemcpyHostToDevice);
+
+		// downweight free cells
+		kernUpdateMapKD << <blocksPerGridFree, BLOCK_SIZE >> >(freePC.size(), dev_kd, dev_free, dev_free_c, FREE_WEIGHT, map_params);
+
+		// upweight existing wall cells
+		kernUpdateMapKD << <blocksPerGridWall, BLOCK_SIZE >> >(wallPC.size(), dev_kd, dev_walls, dev_walls_c, OCCUPIED_WEIGHT, map_params);
+		cudaDeviceSynchronize();
+
+		// insert any new wall cells
+		kernTestCorrespondance << <blocksPerGridWall, BLOCK_SIZE >> >(wallPC.size(), dev_kd, dev_walls, dev_walls_c, dev_wallsCreate, map_params);
+
+		cudaMemcpy(wallsCreate, dev_wallsCreate, wallPC.size()*sizeof(bool), cudaMemcpyDeviceToHost);
+		cudaDeviceSynchronize();
+		
+		int nInsert = 0; 
+		for (int i = 0; i < wallPC.size(); i++) {
+			if (wallsCreate[i]) nInsert++;
+		}
+
+		// we dont want to recreate the kd tree every time, we just want to maintain copies on both the host and device...
+		if (nInsert > 0) {
+			cudaMemcpy(kd, dev_kd, kdSize*sizeof(KDTree::Node), cudaMemcpyDeviceToHost); // make sure to copy new weight values
+			for (int i = 0; i < wallPC.size(); i++) {
+				if (wallsCreate[i]) {
+					wallPC[i].w = -100;
+					KDTree::InsertNode(wallPC[i], kd, kdSize++);
+				}
+			}
+			//printf("new pointcloud size: %i\n", kdSize);
+			cudaMemcpy(dev_kd, kd, kdSize*sizeof(KDTree::Node), cudaMemcpyHostToDevice);
+		}
+
+		checkCUDAError("map update - insert failure");
+
+		cudaFree(dev_walls);
+		cudaFree(dev_walls_c);
+		cudaFree(dev_free);
+		cudaFree(dev_free_c);
+		cudaFree(dev_wallsCreate);
+
+		delete wallsCreate;
+
+	} else { // create a new kd tree from first scan
+		KDTree::Create(wallPC, kd);
+		cudaMemcpy(dev_kd, kd, wallPC.size()*sizeof(KDTree::Node), cudaMemcpyHostToDevice);
+		kdSize += wallPC.size();
+	}
+
+	delete wallCells;
+	delete freeCells;
+}
+
+
+void particleFilterPC(int frame, Lidar *lidar) {
+
+	//special case for first scan
+	if (kdSize == 0) {
+		robotPos = glm::vec3(0.0f, 0.0f, 0.0f);
+		PFUpdateMapKD(lidar->scans[frame]);
+	}
+	else {
+		PFMotionUpdate(frame);	// this does not need to change from Occupancy Grid based approach
+		robotPos = PFMeasurementUpdateKD(lidar->scans[frame]);
+		PFUpdateMapKD(lidar->scans[frame]);
+		PFResample(frame);		// this does not need to change from Occupancy Grid based approach
+
+		//UpdateTopology();
+		//CheckLoopClosure();
+
+	}
 }

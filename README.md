@@ -55,26 +55,12 @@ for a known position when it revisits an area. Below are some examples of maps w
 <img src="images/goal_maps.png" width="600" alt="final maps"  style="margin: auto;display: block;">
 
 The most common method of active loop closure is to build a topology graph on top of the occupancy grid, and as new nodes are added,
-try to merge nodes that are close in euclidean distance, but far apart in graph distance.
+try to merge nodes that are close in euclidean distance, but distance in graph distance.
 <img src="images/graphs.png" width="600" alt="graphs on map"  style="margin: auto;display: block;">
 
 Here, we can see the current code inserting a new node onto the topology graph:
 <img src="images/building_graph.gif" width="600" alt="current code"  style="margin: auto;display: block;">
 
-When closing the loop, a new proposal distribution is created for each node in the graph the loop could close to. Particles are then distributed about each of the proposal distributions relative to their distance from each loop closure node. As more information is gathered, measurements will reinforce which proposal distributions are likely, and slowly incorrect distrbutions are killed off during the resampling processing, keeping the total number of distributions small.
-
-### Particle States
-In the basic approach, each particle state only consists of its position and orientation. In order to use the RBPF implementation, each particle must maintain its own topological graph, as well as its own occupancy map. For large particle counts, even small maps start to take up several gigs of memory that will quickly exceed that available on the GPU. To counteract this, we can assume that particles that belong to the same proposal distribution share local similarity in their topologies and occupancy grids. Therefor, each particle can just be a euclidean tranformation from a single distribution state, and topologies and maps can be stored one time for a group of particles. In practice, there are rarely more than 50 active proposal distributions in the extreme case, therefore, scaling for high particle count implementations should hold well without significant memory overhead.
-
-### Occupancy Grid Optimization
-Currently, particle evaluation is run by sampling the value of the occupancy grid at all walls. However, in most cases, the relative density of walls compared to free space. In theory, the memory footprint could be further reduced if the system only stored the walls. Current solutions recommend storing the global map as a set of local patches that are only generated as needed, however, even this implementation wastes memory resources. The current plan is test effectivenes of only storing wall pixels in a KD-tree. In this implementation, it is hoped that the reduced memory footprint will allow the algorithm to be easily ported into 3D space.
-
-## Section 3: Further Goals
-Depending on success of the RBPF, additional tests will be performed on publicly available 3D data sets. If initial results show promise, integration with the Intel Realsense Time of Flight RGB-D camera will be tested on an NVidia TK1 platform to benchmark performance on low-cost mobile platforms.
-
-For Milestone 2: Finish implementing RBPF
-
-For Milestone 3: Impelement KD-tree optimization and test in 3D
 
 <a name="appendix"/>
 ## Appendix: Build Instructions

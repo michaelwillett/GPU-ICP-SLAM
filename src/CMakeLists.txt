@@ -20,6 +20,10 @@ set(SOURCE_FILES
     "mat.h"
     "matrix.h"
     "tmwtypes.h"
+    "kdtree.cpp"
+    "kdtree.hpp"
+    "pointcloud.cpp"
+    "pointcloud.h"
     )
 
 cuda_add_library(src

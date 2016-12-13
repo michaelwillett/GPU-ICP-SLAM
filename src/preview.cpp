@@ -178,7 +178,7 @@ void mainLoop() {
 	float avg = 0.0f;
 	int i = 0;
     while (!glfwWindowShouldClose(window)) {
-		if (VISUALIZE) {
+		if (VISUALIZE && !PCL_DRAW) {
 			glfwPollEvents();
 
 			i++;
@@ -203,11 +203,12 @@ void mainLoop() {
 		else {
 			i++;
 			start = std::chrono::system_clock::now();
-			runCuda(false);
+			runCuda(VISUALIZE);
 			dur = (std::chrono::duration_cast<std::chrono::milliseconds> (std::chrono::system_clock::now() - start)).count();
 			avg += dur;
 			
-			printf("Average speed: %f fps\n", 1000 / (avg / i));
+			if (i % 1000 == 0)
+				printf("Average speed: %f fps\n", 1000 / (avg / i));
 		}
     }
 	float time = (std::chrono::system_clock::now() - start).count();

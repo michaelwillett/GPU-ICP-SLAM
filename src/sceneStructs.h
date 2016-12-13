@@ -44,12 +44,37 @@ struct Patch {
 	unsigned char uid;
 };
 
+struct Node
+{
+	glm::vec2 pos;
+	float dist;
+};
 
 struct Cluster {
 	unsigned char id;
 	unsigned int nodeIdx;
 	std::vector<unsigned int> patchList;
 
-	std::vector<glm::vec2> nodes;
+	std::vector<Node> nodes;
 	std::vector<std::vector<unsigned int>> edges;
+};
+
+class Map {
+public:
+	void UpdateMap();
+	int mapCorrelation(int N, const MAP_TYPE *map, glm::ivec2 dim, const glm::vec2 *points);
+private:
+	MAP_TYPE map;
+};
+
+class PointCloud : Map {
+public:
+
+private:
+	glm::vec3 points;
+};
+
+class OccupancyGrid : Map {
+private:
+	MAP_TYPE map;
 };

@@ -20,6 +20,9 @@
 #include "utilities.h"
 #include "scene.h"
 #include "lidar.h"
+#include "kdtree.hpp"
+
+#define PCL_DRAW 1
 
 using namespace std;
 
@@ -37,3 +40,5 @@ void runCuda(bool Visualize);
 void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods);
 void mousePositionCallback(GLFWwindow* window, double xpos, double ypos);
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
+void initPCL();
+void drawPCMap();

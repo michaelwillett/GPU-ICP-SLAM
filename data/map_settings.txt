@@ -9,5 +9,5 @@ UP          0 1 0
 
 // Patch size in meters
 MAP
-SIZE 	50 50
+SIZE 	40 40
 RES	.025

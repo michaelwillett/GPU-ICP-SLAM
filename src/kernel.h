@@ -3,12 +3,25 @@
 #include <vector>
 #include "scene.h"
 #include "lidar.h"
+#include "kdtree.hpp"
+
+// Function Device Control
+#define GPU_MOTION		1
+#define GPU_MEASUREMENT 1
+#define GPU_MAP			1
+#define GPU_RESAMPLE	1
 
 void particleFilterInit(Scene *scene);
 void particleFilterFree();
 void particleFilter(uchar4 *pbo, int frame, Lidar *lidar);
 void drawMap(uchar4 *pbo);
 void checkCUDAErrorFn(const char *msg, const char *file, int line);
+void getPCData(Particle **ptrParticles, MAP_TYPE **ptrMap, KDTree::Node **ptrKD, int *nParticles, int *nKD, glm::vec3 &pos);
+
+
+void particleFilterInitPC();
+void particleFilterFreePC();
+void particleFilterPC(int frame, Lidar *lidar);
 
 inline int ilog2(int x) {
 	int lg = 0;

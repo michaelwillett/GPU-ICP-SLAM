@@ -56,17 +56,10 @@ int Scene::loadGeom() {
 	float total = (gridSize.x / res) * (gridSize.y / res);
 	Patch newMap;
 
-	//newGeom.translation = glm::vec3(0.0f);
-	//newGeom.rotation = glm::vec3(0.0f);
 	newMap.scale = gridSize;
 	newMap.resolution = glm::vec3(res, res, 1.0f);
 	newMap.uid = 0;
 
-	//newGeom.transform = utilityCore::buildTransformationMatrix(
-	//	newGeom.translation, newGeom.rotation, newGeom.scale);
-
-	//newGeom.inverseTransform = glm::inverse(newGeom.transform);
-	//newGeom.invTranspose = glm::inverseTranspose(newGeom.transform);
 
 	maps.push_back(newMap);
 

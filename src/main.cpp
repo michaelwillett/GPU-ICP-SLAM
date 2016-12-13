@@ -2,6 +2,17 @@
 #include "preview.h"
 #include <cstring>
 
+#include <boost/make_shared.hpp> 
+#include <boost/thread/thread.hpp>
+#include <pcl/common/common_headers.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/console/parse.h>
+
+
+#define PCL_ENABLE
+
 static std::string startTimeString;
 
 // For camera controls
@@ -76,6 +87,7 @@ int main(int argc, char** argv) {
 
     // Initialize CUDA and GL components
     init();
+	initPCL();
 
     // GLFW main loop
     mainLoop();
@@ -106,53 +118,6 @@ void saveImage() {
     //img.saveHDR(filename);  // Save a Radiance HDR file
 }
 
-void runCuda(bool Visualize) {
-    if (camchanged) {
-        //iteration = 0;
-        Camera &cam = renderState->camera;
-		cameraPosition.x = dx;
-		cameraPosition.y = dy;
-		cameraPosition.z = zoom;
-		
-		cam.position = cameraPosition;
-		cam.lookAt.x = cameraPosition.x;
-		cam.lookAt.y = cameraPosition.y;
-		cam.lookAt.z = 0;
-        camchanged = false;
-      }
-
-    // Map OpenGL buffer object for writing from CUDA on a single GPU
-    // No data is moved (Win & Linux). When mapped to CUDA, OpenGL should not use this buffer
-
-    if (iteration == 0) {
-        particleFilterFree();
-		particleFilterInit(scene);
-		iteration = 5000;
-    }
-
-	bool done = (iteration >= lidar->scans.size() - 1);
-    if (!done) {
-        uchar4 *pbo_dptr = NULL;
-        iteration++;
-        cudaGLMapBufferObject((void**)&pbo_dptr, pbo);
-
-        // execute the kernel
-		particleFilter(pbo_dptr, iteration, lidar);
-
-		// update display
-		if (Visualize || iteration >= lidar->scans.size() - 2) {
-			drawMap(pbo_dptr);
-		}
-
-		// unmap buffer object
-		cudaGLUnmapBufferObject(pbo);
-    } else {
-        saveImage();
-		particleFilterFree();
-        cudaDeviceReset();
-        exit(EXIT_SUCCESS);
-    }
-}
 
 void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action == GLFW_PRESS) {
@@ -182,10 +147,6 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
 
 void mousePositionCallback(GLFWwindow* window, double xpos, double ypos) {
 	if (leftMousePressed) {
-		// compute new camera parameters
-		//phi -= (xpos - lastX) / width;
-		//theta -= (ypos - lastY) / height;
-		//theta = std::fmax(0.001f, std::fmin(theta, PI));
 		dx += (xpos - lastX);
 		dy -= (ypos - lastY);
 		camchanged = true;
@@ -196,19 +157,172 @@ void mousePositionCallback(GLFWwindow* window, double xpos, double ypos) {
 		camchanged = true;
 	}
 	else if (middleMousePressed) {
-		//renderState = &scene->state;
-		//Camera &cam = renderState->camera;
-		//glm::vec3 forward = cam.view;
-		//forward.y = 0.0f;
-		//forward = glm::normalize(forward);
-		//glm::vec3 right = cam.right;
-		//right.y = 0.0f;
-		//right = glm::normalize(right);
-
-		//cam.lookAt -= (float) (xpos - lastX) * right * 0.01f;
-		//cam.lookAt += (float) (ypos - lastY) * forward * 0.01f;
-		//camchanged = true;
 	}
 	lastX = xpos;
 	lastY = ypos;
+}
+
+
+boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
+
+void initPCL() {
+	viewer->setBackgroundColor(255, 255, 255);
+	viewer->addCoordinateSystem(1.0);
+	viewer->removeCoordinateSystem();
+	viewer->initCameraParameters();
+}
+
+void runCuda(bool Visualize) {
+	if (camchanged) {
+		//iteration = 0;
+		Camera &cam = renderState->camera;
+		cameraPosition.x = dx;
+		cameraPosition.y = dy;
+		cameraPosition.z = zoom;
+
+		cam.position = cameraPosition;
+		cam.lookAt.x = cameraPosition.x;
+		cam.lookAt.y = cameraPosition.y;
+		cam.lookAt.z = 0;
+		camchanged = false;
+	}
+
+	// Map OpenGL buffer object for writing from CUDA on a single GPU
+	// No data is moved (Win & Linux). When mapped to CUDA, OpenGL should not use this buffer
+
+	if (iteration == 0) {
+		particleFilterFree();
+		particleFilterInit(scene);
+		//iteration = 10000;	// change start point here for debugging
+	}
+
+	bool done = (iteration >= lidar->scans.size() - 1);
+	if (!done) {
+		uchar4 *pbo_dptr = NULL;
+		iteration++;
+		cudaGLMapBufferObject((void**)&pbo_dptr, pbo);
+
+		// execute the kernel
+		particleFilter(pbo_dptr, iteration, lidar);
+
+		// update display
+		if (Visualize || iteration >= lidar->scans.size() - 2) {
+			if (PCL_DRAW) {
+				drawPCMap();
+			}
+			else {
+				drawMap(pbo_dptr);
+			}
+		}
+		else {
+		}
+
+		// unmap buffer object
+		cudaGLUnmapBufferObject(pbo);
+	}
+	else {
+		saveImage();
+		particleFilterFree();
+		cudaDeviceReset();
+		exit(EXIT_SUCCESS);
+	}
+}
+
+void drawPCMap() {
+	Particle *ptrParticles = NULL;
+	MAP_TYPE *ptrMap = NULL;
+	KDTree::Node *ptrKD = NULL;
+	int nParticles, nKD;
+	glm::vec3 pos(0.0f);
+	getPCData(&ptrParticles, &ptrMap, &ptrKD, &nParticles, &nKD, pos);
+
+
+	// Occupancy grid walls
+	pcl::PointCloud<pcl::PointXYZRGB>::Ptr walls(new pcl::PointCloud<pcl::PointXYZRGB>);
+	uint8_t r(0), g(0), b(0);
+	glm::ivec2 map_dim = glm::ivec2(scene->maps[0].scale.x / scene->maps[0].resolution.x, scene->maps[0].scale.y / scene->maps[0].resolution.y);
+	//for (int x = 0; x < map_dim.x; x++) {
+	//	for (int y = 0; y < map_dim.y; y++) {
+	//		int idx = (x * map_dim.x) + y;
+	//		char test = ptrMap[idx];
+	//		if (ptrMap[idx] > 30) {
+	//			pcl::PointXYZRGB point;
+	//			
+	//			point.x = x * scene->maps[0].resolution.x - scene->maps[0].scale.x / 2.0f;
+	//			point.y = y * scene->maps[0].resolution.y - scene->maps[0].scale.y / 2.0f;
+	//			point.z = 0.0f;
+	//			uint32_t rgb = (static_cast<uint32_t>(r) << 16 | static_cast<uint32_t>(g) << 8 | static_cast<uint32_t>(b));
+	//			point.rgb = *reinterpret_cast<float*>(&rgb);
+	//			walls->points.push_back(point);
+	//		}
+	//	}
+	//}
+	walls->width = (int)walls->points.size();
+	walls->height = 1;
+	viewer->addPointCloud<pcl::PointXYZRGB>(walls, "walls", 0);
+	viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 4, "walls");
+
+
+	// draw point cloud walls
+	pcl::PointCloud<pcl::PointXYZRGB>::Ptr kdField(new pcl::PointCloud<pcl::PointXYZRGB>);
+	r = 0, g = 0, b = 0;
+	for (int i = 0; i < nKD; i++) {
+		if (ptrKD[i].value.w > -100) {
+
+			r = 150 - ptrKD[i].value.w;
+			g = 150 - ptrKD[i].value.w;
+			b = 150 - ptrKD[i].value.w;
+
+			pcl::PointXYZRGB point;
+			point.x = ptrKD[i].value.x;
+			point.y = ptrKD[i].value.y;
+			point.z = ptrKD[i].value.z;
+			uint32_t rgb = (static_cast<uint32_t>(r) << 16 | static_cast<uint32_t>(g) << 8 | static_cast<uint32_t>(b));
+			point.rgb = *reinterpret_cast<float*>(&rgb);
+			kdField->points.push_back(point);
+		}
+	}
+	kdField->width = (int)kdField->points.size();
+	kdField->height = 1;
+	viewer->addPointCloud<pcl::PointXYZRGB>(kdField, "kd", 0);
+	viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 4, "kd");
+
+
+
+	// draw a pointcloud
+	pcl::PointCloud<pcl::PointXYZRGB>::Ptr particleField(new pcl::PointCloud<pcl::PointXYZRGB>);
+	r = (255), g = (15), b = (15);
+	for (int i = 0; i < nParticles; i++) {
+		pcl::PointXYZRGB point;
+		point.x = ptrParticles[i].pos.x;
+		point.y = ptrParticles[i].pos.y;
+		point.z = 0.01f;
+		uint32_t rgb = (static_cast<uint32_t>(r) << 16 | static_cast<uint32_t>(g) << 8 | static_cast<uint32_t>(b));
+		point.rgb = *reinterpret_cast<float*>(&rgb);
+		particleField->points.push_back(point);
+	}
+	particleField->width = (int)particleField->points.size();
+	particleField->height = 1;
+	viewer->addPointCloud<pcl::PointXYZRGB>(particleField, "particles", 0);
+	viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "particles");
+
+	//set robot pos
+	pcl::PointCloud<pcl::PointXYZRGB>::Ptr robot(new pcl::PointCloud<pcl::PointXYZRGB>);
+	r = (15), g = (255), b = (15);
+	pcl::PointXYZRGB point;
+	point.x = pos.x;
+	point.y = pos.y;
+	point.z = 0.02f; // pos.z in 2d is heading angle
+	uint32_t rgb = (static_cast<uint32_t>(r) << 16 | static_cast<uint32_t>(g) << 8 | static_cast<uint32_t>(b));
+	point.rgb = *reinterpret_cast<float*>(&rgb);
+	robot->points.push_back(point);
+	viewer->addPointCloud<pcl::PointXYZRGB>(robot, "robot", 0);
+	viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 8, "robot");
+
+	// basic view
+	viewer->spinOnce();
+	viewer->removePointCloud("particles");
+	viewer->removePointCloud("walls");
+	viewer->removePointCloud("kd");
+	viewer->removePointCloud("robot");
 }
