@@ -29,4 +29,5 @@ namespace KDTree
 	void Create(std::vector<glm::vec4> input, Node *list);
 	void InsertList(std::vector<glm::vec4> input, Node *list, int idx, int parent);
 	void InsertNode(glm::vec4 point, Node *list, int listSize);
+	void Balance(Node *list, int listSize);
 };

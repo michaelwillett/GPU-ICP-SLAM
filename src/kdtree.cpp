@@ -28,6 +28,16 @@ void KDTree::Create(std::vector<glm::vec4> input, Node *list)
 	InsertList(input, list, 0, -1);
 }
 
+void KDTree::Balance(Node *list, int listSize)
+{
+	std::vector<glm::vec4> input;
+
+	for (int i = 0; i < listSize; i++) {
+		input.push_back(list[i].value);
+	}
+
+	Create(input, list);
+}
 
 void KDTree::InsertList(std::vector<glm::vec4> input, Node *list, int idx, int parent)
 {
@@ -93,6 +103,7 @@ void KDTree::InsertNode(glm::vec4 point, Node *list, int listSize)
 	// add new node to end of list
 	list[listSize] = Node(point, (axis + 1) % 3, parent);
 }
+
 
 KDTree::Node::Node() {
 	left = -1;

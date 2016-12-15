@@ -707,21 +707,21 @@ void UpdateTopology() {
 		}
 
 		// if we don't need a new node for distance, check if we need one from visibility
-		if (!newNode) { // run this on GPU to prevent sending the maps back and forth, this operation can be slow even for a small graph
-			newNode = true;
+		//if (!newNode) { // run this on GPU to prevent sending the maps back and forth, this operation can be slow even for a small graph
+		//	newNode = true;
 
-			// 1D block for particles
-			for (int j = 0; j < clusters[i].nodes.size(); j++) {
-				int nWalls = FindWalls(i, j);
-				//if (nWalls > 0) printf("found %i walls for node %i\n", nWalls, j);
-				newNode &= (nWalls >= MIN_WALL_COUNT);// && (glm::distance((glm::vec2) robotPos, clusters[i].nodes[j].pos) > MIN_NODE_DIST);
-			}
-			
-			if (newNode) {
-				CreateNode(i);
-				printf("new node from visibility. number of graph nodes: %i\n", clusters[i].nodes.size());
-			}
-		}
+		//	// 1D block for particles
+		//	for (int j = 0; j < clusters[i].nodes.size(); j++) {
+		//		int nWalls = FindWalls(i, j);
+		//		//if (nWalls > 0) printf("found %i walls for node %i\n", nWalls, j);
+		//		newNode &= (nWalls >= MIN_WALL_COUNT);// && (glm::distance((glm::vec2) robotPos, clusters[i].nodes[j].pos) > MIN_NODE_DIST);
+		//	}
+		//	
+		//	if (newNode) {
+		//		CreateNode(i);
+		//		printf("new node from visibility. number of graph nodes: %i\n", clusters[i].nodes.size());
+		//	}
+		//}
 	}
 }
 
@@ -794,57 +794,6 @@ void CheckLoopClosure() {
 	}
 }
 
-/**
- * Wrapper for the __global__ call that sets up the kernel calls and does a ton
- * of memory management
- */
-void particleFilter(uchar4 *pbo, int frame, Lidar *lidar) {
-	particleFilterPC(frame, lidar);
-
-
-	//// timing metrics
-	//if (frame % 100 == 0) {
-	//	avg_motion = 0.0f;
-	//	avg_measurement = 0.0f;
-	//	avg_map = 0.0f;
-	//	avg_sample = 0.0f;
-	//}
-
-	//std::chrono::time_point<std::chrono::system_clock> start, end;
-	//
-	//start = std::chrono::system_clock::now();
-	//PFMotionUpdate(frame);
-	//end = std::chrono::system_clock::now();
-	//avg_motion += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	//start = end;
-
-	//robotPos = PFMeasurementUpdate(lidar->scans[frame]);
-	//end = std::chrono::system_clock::now();
-	//avg_measurement += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	//start = end;
-	//
-	//PFUpdateMap(lidar->scans[frame]);
-	//end = std::chrono::system_clock::now();
-	//avg_map += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	//start = end;
-	//
-	//PFResample(frame);
-	//end = std::chrono::system_clock::now();
-	//avg_sample += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
-	//start = end;
-
-	//UpdateTopology();
-	//CheckLoopClosure();
-
-	//// print timing metrics
-	//if (frame % 100 == -1) {
-	//	cout << "Frame " << frame << ":" << endl;
-	//	printf("    motion:      %3.2f\n", avg_motion / 100.0f);
-	//	printf("    measurement: %3.2f\n", avg_measurement / 100.0f);
-	//	printf("    map:         %3.2f\n", avg_map / 100.0f);
-	//	printf("    resample:    %3.2f\n", avg_sample / 100.0f);
-	//}
-}
 
 void drawMap(uchar4 *pbo) {
 	drawAll(pbo, PARTICLE_COUNT, hst_scene, dev_image, robotPos, dev_particles, dev_occupancyGrid, dev_maps, clusters);
@@ -922,14 +871,14 @@ __global__ void outerProduct(int N, const glm::vec4 *vec1, const glm::vec4 *vec2
 		glm::vec3(vec1[i] * vec2[i].z));
 }
 
-__global__ void findCorrespondenceKD(int N, int sizeScene, glm::vec4 *cor, const glm::vec4 *points, const KDTree::Node* tree)
+__global__ void findCorrespondenceKD(int N, glm::vec4 *cor, const glm::vec4 *points, const KDTree::Node* tree)
 {
 	int i = threadIdx.x + (blockIdx.x * blockDim.x);
 	if (i >= N) {
 		return;
 	}
 
-	glm::vec4 pt = points[i + sizeScene];
+	glm::vec4 pt = points[i];
 	float bestDist = glm::distance(glm::vec3(pt), glm::vec3(tree[0].value));
 	int bestIdx = 0;
 	int head = 0;
@@ -1043,7 +992,6 @@ __global__ void kernGetWallsKD(float *lidar, glm::vec3 robotPos, glm::vec4 *node
 
 glm::vec3 transformPointICP(glm::vec3 start, std::vector<float> lidar) {
 	int sizeTarget = LIDAR_SIZE;
-	int sizeScene = kdSize;
 	glm::vec3 retv = start;
 	
 	dim3 fullBlocksPerGrid((LIDAR_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -1064,7 +1012,7 @@ glm::vec3 transformPointICP(glm::vec3 start, std::vector<float> lidar) {
 	//kernGetWalls << <fullBlocksPerGrid, BLOCK_SIZE >> >(dev_lidar, center_idx, robotPos.z, dev_freeCells, dev_wallCells, map_dim, map_params);
 	kernGetWallsKD << <fullBlocksPerGrid, BLOCK_SIZE >> >(dev_lidar, robotPos, dev_target, map_params);
 
-	findCorrespondenceKD << <fullBlocksPerGrid, BLOCK_SIZE >> >(sizeTarget, sizeScene, dev_cor, dev_target, dev_kd);
+	findCorrespondenceKD << <fullBlocksPerGrid, BLOCK_SIZE >> >(sizeTarget, dev_cor, dev_target, dev_kd);
 	cudaThreadSynchronize();
 
 	// Calculate mean centered correspondenses 
@@ -1130,6 +1078,7 @@ glm::vec3 transformPointICP(glm::vec3 start, std::vector<float> lidar) {
 	//newPoint = transform*newPoint;
 	float theta = asin(R[0][1]);
 
+
 	retv.x += t.x;
 	retv.y += t.y;
 	retv.z += theta;
@@ -1172,20 +1121,110 @@ void particleFilterFreePC() {
 	checkCUDAError("particleFilterFreePC");
 }
 
+__device__ float weight[LIDAR_SIZE];
+__device__ float particlePos[3];
+__device__ float atmWeight[PARTICLE_COUNT*LIDAR_SIZE];
 
-__device__ float EvaluateParticleKD(MAP_TYPE *map, glm::ivec2 map_dim, Patch map_params, Particle &particle, glm::vec3 pos, float *lidar, KDTree::Node *kdTree, int kdSize)
+
+
+__global__ void kernFindWallCorrespondance(float *lidar, KDTree::Node *kdTree, int nParticle) {
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < LIDAR_SIZE) {
+		glm::vec2 walls;
+		glm::vec4 pt;
+		CleanLidarScan(i, lidar[i], particlePos[2], walls);
+
+		if (abs(walls.x) < LIDAR_RANGE && abs(walls.y) < LIDAR_RANGE) {
+			walls.x += particlePos[0];
+			walls.y += particlePos[1];
+
+			pt.x = walls.x;
+			pt.y = walls.y;
+			pt.z = 0.0f;
+			pt.w = 0.0f;
+
+			float bestDist = glm::distance(glm::vec3(pt), glm::vec3(kdTree[0].value));
+			int bestIdx = 0;
+			int head = 0;
+			bool done = false;
+			bool branch = false;
+			bool nodeFullyExplored = false;
+
+			while (!done) {
+				// depth first on current branch
+				while (head >= 0) {
+					// check the current node
+					const KDTree::Node test = kdTree[head];
+					float d = glm::distance(glm::vec3(pt), glm::vec3(test.value));
+					if (d < bestDist) {
+						bestDist = d;
+						bestIdx = head;
+						nodeFullyExplored = false;
+					}
+
+					// find branch path
+					getHyperplaneDist(&pt, &test.value, test.axis, &branch);
+					head = branch ? test.left : test.right;
+				}
+
+				if (nodeFullyExplored) {
+					done = true;
+				}
+				else {
+					// check if parent of best node could have better values on other branch
+					const KDTree::Node parent = kdTree[kdTree[bestIdx].parent];
+					if (getHyperplaneDist(&pt, &parent.value, parent.axis, &branch) < bestDist) {
+						head = !branch ? parent.left : parent.right;
+						nodeFullyExplored = true;
+					}
+					else
+						done = true;
+				}
+			}
+
+			atmWeight[LIDAR_SIZE*nParticle + i] = kdTree[bestIdx].value.w;
+
+			//atomicAdd(&atmWeight[nParticle], kdTree[bestIdx].value.w);
+		}
+		else {
+			atmWeight[LIDAR_SIZE*nParticle + i] = 0;
+		}
+	}
+}
+
+#define DYNAMIC_KERN 0
+
+__device__ float EvaluateParticleKD(MAP_TYPE *map, glm::ivec2 map_dim, Patch map_params, Particle &particle, glm::vec3 pos, float *lidar, KDTree::Node *kdTree, int kdSize, int nParticle)
 {
 	// get walls relative to robot position, add particle position
 	glm::vec2 walls;
 	glm::vec4 pt;
-
+	
 	int nValid = 0;
 	glm::vec3 mu_tar(0.0f);
 	glm::vec3 mu_cor(0.0f);
 	float retv = 0.0f;
 
+#if (DYNAMIC_KERN == 1)
+	// try launching dynamic kernel
+	// 1D block for LIDAR
+	const int blockSize1d = 128;
+	const dim3 blocksPerGrid1d((LIDAR_SIZE + blockSize1d - 1) / blockSize1d);
+
+	particlePos[0] = particle.pos.x;
+	particlePos[1] = particle.pos.y;
+	particlePos[2] = particle.pos.z;
+	atmWeight[nParticle] = 0.0f;
+
+	kernFindWallCorrespondance << <blocksPerGrid1d, blockSize1d >> >(lidar, kdTree, nParticle);
+	__syncthreads();
+#endif
+
 	// get walls and find correspondence
 	for (int j = 0; j < LIDAR_SIZE; j++) {
+
+#if (DYNAMIC_KERN == 0)
 		CleanLidarScan(j, lidar[j], particle.pos.z, walls);
 
 		if (abs(walls.x) < LIDAR_RANGE && abs(walls.y) < LIDAR_RANGE) {
@@ -1243,9 +1282,11 @@ __device__ float EvaluateParticleKD(MAP_TYPE *map, glm::ivec2 map_dim, Patch map
 
 			//if (glm::distance((glm::vec3) pt, (glm::vec3) kdTree[bestIdx].value) < minDist) {
 				retv += kdTree[bestIdx].value.w;
-				nValid++;
-			//}
+		//}
 		} 
+#else
+		retv += atmWeight[LIDAR_SIZE*nParticle + j];
+#endif
 	}
 
 	//printf("matches found: %i %.4f\n", nValid, retv);
@@ -1262,7 +1303,7 @@ __global__ void kernEvaluateParticlesKD(MAP_TYPE *map, glm::ivec2 map_dim, Patch
 	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
 
 	if (i < PARTICLE_COUNT) {
-		fit[i] = EvaluateParticleKD(map, map_dim, map_params, particles[i], pos, lidar, kdTree, kdSize);
+		fit[i] = EvaluateParticleKD(map, map_dim, map_params, particles[i], pos, lidar, kdTree, kdSize, i);
 	}
 }
 
@@ -1298,13 +1339,10 @@ glm::vec3 PFMeasurementUpdateKD(std::vector<float> lidar) {
 
 	// only use best point for return
 	cudaMemcpy(particles, dev_particles, PARTICLE_COUNT * sizeof(glm::vec4), cudaMemcpyDeviceToHost);
-	retv = (glm::vec3) particles[best].pos;
+	//retv = (glm::vec3) particles[best].pos;
 
 	// run ICP on final point only
-	//retv = transformPointICP((glm::vec3) particles[best].pos, lidar);
-	retv = (glm::vec3) particles[best].pos;
-
-	//printf("pos: %.4f %.4f %.4f\n", retv.x, retv.y, retv.z);
+	retv = transformPointICP((glm::vec3) particles[best].pos, lidar);
 
 	return retv;
 }
@@ -1341,6 +1379,29 @@ __global__ void kernTestCorrespondance(int N, KDTree::Node* tree, glm::vec4 *tar
 }
 
 
+__global__ void kernGeneratePosArray(glm::vec4 *out, glm::vec3 pos, glm::ivec2 dim, Patch params)
+{
+	int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (i < dim.x*dim.y) {
+		int x = i / dim.x;
+		int y = i % dim.x;
+		out[i].x = x * params.resolution.x - params.scale.x / 2.0f + pos.x;
+		out[i].y = y * params.resolution.y - params.scale.y / 2.0f + pos.y;
+		out[i].x = ROUND_FRAC(out[i].x, params.resolution.x);
+		out[i].y = ROUND_FRAC(out[i].y, params.resolution.y);
+		out[i].z = 0.0f;
+	}
+}
+
+struct is_true
+{
+	__host__ __device__
+		bool operator()(const bool x)
+	{
+		return x == true;
+	}
+};
 
 void PFUpdateMapKD(std::vector<float> lidar) {
 	// get local free and occupied grid cells here. Use these values to update pointcloud
@@ -1474,12 +1535,180 @@ void PFUpdateMapKD(std::vector<float> lidar) {
 		kdSize += wallPC.size();
 	}
 
-	delete wallCells;
-	delete freeCells;
+	delete[] wallCells;
+	delete[] freeCells;
+}
+
+void PFUpdateMapKD_SLOW(std::vector<float> lidar) {
+	// get local free and occupied grid cells here. Use these values to update pointcloud
+	glm::ivec2 center_idx(
+		round(0.5f * map_dim.x + map_params.resolution.x / 2),
+		round(0.5f * map_dim.y + map_params.resolution.y / 2)
+		);
+	
+	// 1D block for particles
+	const int blockSize1d = 128;
+	const dim3 blocksPerGridLidar((LIDAR_SIZE + blockSize1d - 1) / blockSize1d);
+
+	// find occupancy grid cells from translated lidar
+	cudaMemset(dev_freeCells, 0, map_dim.x * map_dim.y*sizeof(bool));
+	cudaMemset(dev_wallCells, 0, map_dim.x * map_dim.y*sizeof(bool));
+	cudaMemcpy(dev_lidar, &lidar[0], LIDAR_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+
+	// find intersections from lidar scan
+	kernGetWalls << <blocksPerGridLidar, blockSize1d >> >(dev_lidar, center_idx, robotPos.z, dev_freeCells, dev_wallCells, map_dim, map_params);
+
+	//// create index list
+	//glm::vec4 *dev_pos, *dev_walls_pc, *dev_free_pc;
+	//cudaMalloc((void**)&dev_pos, map_dim.x*map_dim.y*sizeof(glm::vec4));
+	//cudaMalloc((void**)&dev_walls_pc, map_dim.x*map_dim.y*sizeof(glm::vec4));
+	//cudaMalloc((void**)&dev_free_pc, map_dim.x*map_dim.y*sizeof(glm::vec4));
+	//const dim3 blocksPerGridMap((map_dim.x*map_dim.y + blockSize1d - 1) / blockSize1d);
+	//kernGeneratePosArray << < blocksPerGridMap, blockSize1d >> >(dev_pos, robotPos, map_dim, map_params);
+
+	//thrust::device_ptr<glm::vec4> ptr_pos = thrust::device_pointer_cast(dev_pos);
+	//int nWalls = thrust::copy_if(thrust::device, ptr_pos, ptr_pos + map_dim.x*map_dim.y, dev_wallCells, dev_walls_pc, is_true()) - dev_walls_pc;
+	//int nFree = thrust::copy_if(thrust::device, ptr_pos, ptr_pos + map_dim.x*map_dim.y, dev_freeCells, dev_free_pc, is_true()) - dev_free_pc;
+
+	bool *wallCells = new bool[map_dim.x * map_dim.y];
+	bool *freeCells = new bool[map_dim.x * map_dim.y];
+	std::vector<glm::vec4> wallPC;
+	std::vector<glm::vec4> freePC;
+
+	cudaMemcpy(wallCells, dev_wallCells, map_dim.x * map_dim.y * sizeof(bool), cudaMemcpyDeviceToHost);
+	cudaMemcpy(freeCells, dev_freeCells, map_dim.x * map_dim.y * sizeof(bool), cudaMemcpyDeviceToHost);
+
+	// Create Pointclouds here
+	// parallelize through compactions and summation
+	for (int x = 0; x < map_dim.x; x++) {
+		for (int y = 0; y < map_dim.y; y++) {
+			int idx = (x * map_dim.x) + y;
+
+			if (wallCells[idx]) {
+				glm::vec4 point;
+
+				point.x = x * map_params.resolution.x - map_params.scale.x / 2.0f + robotPos.x;
+				point.y = y * map_params.resolution.y - map_params.scale.y / 2.0f + robotPos.y;
+				point.x = ROUND_FRAC(point.x, map_params.resolution.x);
+				point.y = ROUND_FRAC(point.y, map_params.resolution.y);
+				point.z = 0.0f;
+				wallPC.push_back(point);
+			}
+
+			if (freeCells[idx]) {
+				glm::vec4 point;
+
+				point.x = x * map_params.resolution.x - map_params.scale.x / 2.0f + robotPos.x;
+				point.y = y * map_params.resolution.y - map_params.scale.y / 2.0f + robotPos.y;
+				point.x = ROUND_FRAC(point.x, map_params.resolution.x);
+				point.y = ROUND_FRAC(point.y, map_params.resolution.y);
+				point.z = 0.0f;
+				freePC.push_back(point);
+			}
+		}
+	}
+	int nFree = freePC.size();
+	int nWalls = wallPC.size();
+	
+
+	if (kdSize > 0) {
+		// downweight existing wall cells if in freeCells
+		const dim3 blocksPerGridFree((nFree + blockSize1d - 1) / blockSize1d);
+		const dim3 blocksPerGridWall((nWalls + blockSize1d - 1) / blockSize1d);
+
+		glm::vec4 *dev_walls_pc, *dev_free_pc;
+		cudaMalloc((void**)&dev_walls_pc, nWalls*sizeof(glm::vec4));
+		cudaMalloc((void**)&dev_free_pc, nFree*sizeof(glm::vec4));
+
+		int *dev_walls_c, *dev_free_c;
+		cudaMalloc((void**)&dev_walls_c, nWalls*sizeof(int));
+		cudaMalloc((void**)&dev_free_c, nFree*sizeof(int));
+
+		findCorrespondenceIndexKD << <blocksPerGridFree, BLOCK_SIZE >> >(nFree, dev_free_c, dev_free_pc, dev_kd);
+		findCorrespondenceIndexKD << <blocksPerGridWall, BLOCK_SIZE >> >(nWalls, dev_walls_c, dev_walls_pc, dev_kd);
+
+		cudaDeviceSynchronize();
+		checkCUDAError("map update - correspondance failure");
+
+		bool *wallsCreate = new bool[nWalls];
+		bool *dev_wallsCreate = NULL;
+		cudaMalloc((void**)&dev_wallsCreate, nWalls*sizeof(bool));
+
+
+		// downweight free cells
+		kernUpdateMapKD << <blocksPerGridFree, BLOCK_SIZE >> >(nFree, dev_kd, dev_free_pc, dev_free_c, FREE_WEIGHT, map_params);
+
+		// upweight existing wall cells
+		kernUpdateMapKD << <blocksPerGridWall, BLOCK_SIZE >> >(nWalls, dev_kd, dev_walls_pc, dev_walls_c, OCCUPIED_WEIGHT, map_params);
+		cudaDeviceSynchronize();
+
+		// insert any new wall cells
+		kernTestCorrespondance << <blocksPerGridWall, BLOCK_SIZE >> >(nWalls, dev_kd, dev_walls_pc, dev_walls_c, dev_wallsCreate, map_params);
+
+		cudaMemcpy(wallsCreate, dev_wallsCreate, nWalls*sizeof(bool), cudaMemcpyDeviceToHost);
+		cudaDeviceSynchronize();
+		
+		int nInsert = thrust::count(thrust::device, dev_wallsCreate, dev_wallsCreate + nWalls, true);
+
+		// we dont want to recreate the kd tree every time, we just want to maintain copies on both the host and device...
+		if (nInsert > 0) {
+			glm::vec4 *wallPC = new glm::vec4[nWalls];
+			cudaMemcpy(kd, dev_kd, kdSize*sizeof(KDTree::Node), cudaMemcpyDeviceToHost); // make sure to copy new weight values
+			cudaMemcpy(wallPC, dev_walls_pc, nWalls*sizeof(glm::vec4), cudaMemcpyDeviceToHost); 
+			for (int i = 0; i < nWalls; i++) {
+				if (wallsCreate[i]) {
+					wallPC[i].w = -100;
+					KDTree::InsertNode(wallPC[i], kd, kdSize++);
+				}
+			}
+			//printf("new pointcloud size: %i\n", kdSize);
+			cudaMemcpy(dev_kd, kd, kdSize*sizeof(KDTree::Node), cudaMemcpyHostToDevice);
+			delete[] wallPC;
+		}
+
+		checkCUDAError("map update - insert failure");
+
+		cudaFree(dev_walls_c);
+		cudaFree(dev_free_c);
+		cudaFree(dev_wallsCreate);
+		cudaFree(dev_walls_pc);
+		cudaFree(dev_free_pc);
+
+		delete[] wallsCreate;
+
+	} else { // create a new kd tree from first scan
+		//std::vector<glm::vec4> wallPC;
+		//wallPC.reserve(nWalls);
+		//wallPC.push_back(glm::vec4(0.0f));
+		//cudaMemcpy(&wallPC[0], dev_walls_pc, nWalls*sizeof(glm::vec4), cudaMemcpyDeviceToHost);
+
+		KDTree::Create(wallPC, kd);
+		cudaMemcpy(dev_kd, kd, nWalls*sizeof(KDTree::Node), cudaMemcpyHostToDevice);
+		kdSize += wallPC.size();
+	}
+
+	//cudaFree(dev_pos);
+	//cudaFree(dev_walls_pc);
+	//cudaFree(dev_free_pc);
+	delete[] wallCells;
+	delete[] freeCells;
 }
 
 
-void particleFilterPC(int frame, Lidar *lidar) {
+/**
+* Wrapper for the __global__ call that sets up the kernel calls and does a ton
+* of memory management
+*/
+void particleFilter(uchar4 *pbo, int frame, Lidar *lidar) {
+
+	if (frame % 1000 == 0)
+		printf("PC size: %i\n", kdSize);
+
+	if (frame % 100 == 5) {
+		cudaMemcpy(kd, dev_kd, kdSize*sizeof(KDTree::Node), cudaMemcpyDeviceToHost);
+		KDTree::Balance(kd, kdSize);
+		cudaMemcpy(dev_kd, kd, kdSize*sizeof(KDTree::Node), cudaMemcpyHostToDevice);
+	}
 
 	//special case for first scan
 	if (kdSize == 0) {
@@ -1487,13 +1716,53 @@ void particleFilterPC(int frame, Lidar *lidar) {
 		PFUpdateMapKD(lidar->scans[frame]);
 	}
 	else {
-		PFMotionUpdate(frame);	// this does not need to change from Occupancy Grid based approach
+		// timing metrics
+		if (frame % 100 == 0) {
+			avg_motion = 0.0f;
+			avg_measurement = 0.0f;
+			avg_map = 0.0f;
+			avg_sample = 0.0f;
+		}
+
+		std::chrono::time_point<std::chrono::system_clock> start, end;
+		
+		start = std::chrono::system_clock::now();
+		PFMotionUpdate(frame);
+		end = std::chrono::system_clock::now();
+		avg_motion += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+		start = end;
+
 		robotPos = PFMeasurementUpdateKD(lidar->scans[frame]);
+		end = std::chrono::system_clock::now();
+		avg_measurement += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+		start = end;
+		
 		PFUpdateMapKD(lidar->scans[frame]);
-		PFResample(frame);		// this does not need to change from Occupancy Grid based approach
+		end = std::chrono::system_clock::now();
+		avg_map += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+		start = end;
+		
+		PFResample(frame);
+		end = std::chrono::system_clock::now();
+		avg_sample += (std::chrono::duration_cast<std::chrono::microseconds> (end - start)).count();
+		start = end;
 
 		//UpdateTopology();
 		//CheckLoopClosure();
-
+		
+		// print timing metrics
+		if (frame % 100 == 0) {
+			cout << "Frame " << frame << ":" << endl;
+			printf("    motion:      %3.2f\n", avg_motion / 100.0f);
+			printf("    measurement: %3.2f\n", avg_measurement / 100.0f);
+			printf("    map:         %3.2f\n", avg_map / 100.0f);
+			printf("    resample:    %3.2f\n", avg_sample / 100.0f);
+		}
 	}
+
+
+
+
+
+
 }
